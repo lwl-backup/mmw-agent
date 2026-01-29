@@ -1406,7 +1406,10 @@ func (h *ManageHandler) getInboundTagsFromGRPC() []string {
 
 	tags := make([]string, 0, len(resp.Inbounds))
 	for _, ib := range resp.Inbounds {
-		tags = append(tags, ib.Tag)
+		// 过滤掉 tag="api" 和空 tag（Xray 内部入站）
+		if ib.Tag != "" && ib.Tag != "api" {
+			tags = append(tags, ib.Tag)
+		}
 	}
 	return tags
 }
@@ -1427,9 +1430,27 @@ func (h *ManageHandler) mergeInbounds(configInbounds []map[string]interface{}, r
 	result := make([]map[string]interface{}, 0, len(configInbounds)+len(runtimeTags))
 	for _, ib := range configInbounds {
 		tag, _ := ib["tag"].(string)
+		// 跳过 tag="api" 的入站（Xray 内部 API 入站）
+		if tag == "api" {
+			continue
+		}
 		ibCopy := make(map[string]interface{})
 		for k, v := range ib {
 			ibCopy[k] = v
+		}
+		// 如果 tag 为空，根据协议和端口生成名称
+		if tag == "" {
+			protocol, _ := ib["protocol"].(string)
+			port := 0
+			if p, ok := ib["port"].(float64); ok {
+				port = int(p)
+			} else if p, ok := ib["port"].(int); ok {
+				port = p
+			}
+			if protocol != "" && port > 0 {
+				ibCopy["tag"] = fmt.Sprintf("%s-%d", protocol, port)
+				ibCopy["_generated_tag"] = true
+			}
 		}
 		if runtimeTagSet[tag] {
 			ibCopy["_runtime_status"] = "running"

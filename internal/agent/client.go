@@ -138,7 +138,9 @@ func (c *Client) runWebSocket(ctx context.Context) {
 	defer c.wg.Done()
 
 	maxConsecutiveFailures := 5
+	maxAuthFailures := 10
 	consecutiveFailures := 0
+	authFailures := 0
 
 	for {
 		select {
@@ -156,8 +158,31 @@ func (c *Client) runWebSocket(ctx context.Context) {
 				return
 			}
 
+			// Check if this is an authentication error
+			if authErr, ok := err.(*AuthError); ok {
+				authFailures++
+				if authErr.IsTokenInvalid() {
+					log.Printf("[Agent] Authentication failed (invalid token): %v", err)
+					if authFailures >= maxAuthFailures {
+						log.Printf("[Agent] Too many auth failures (%d), entering sleep mode (30 min backoff)", authFailures)
+						c.waitWithTrafficReport(ctx, 30*time.Minute)
+						authFailures = 0
+						continue
+					}
+				}
+				// Use longer backoff for auth errors
+				backoff := time.Duration(authFailures) * 30 * time.Second
+				if backoff > 10*time.Minute {
+					backoff = 10 * time.Minute
+				}
+				log.Printf("[Agent] Auth error, reconnecting in %v...", backoff)
+				c.waitWithTrafficReport(ctx, backoff)
+				continue
+			}
+
 			log.Printf("[Agent] WebSocket error: %v", err)
 			consecutiveFailures++
+			authFailures = 0 // Reset auth failures on non-auth errors
 
 			if consecutiveFailures >= maxConsecutiveFailures {
 				log.Printf("[Agent] Too many WebSocket failures (%d), switching to auto mode for fallback...", consecutiveFailures)
@@ -167,6 +192,7 @@ func (c *Client) runWebSocket(ctx context.Context) {
 			}
 		} else {
 			consecutiveFailures = 0
+			authFailures = 0
 		}
 
 		backoff := c.calculateBackoff()
@@ -862,16 +888,23 @@ func (c *Client) getSystemNetworkStats() (rxBytes, txBytes int64) {
 // AuthError represents an authentication error
 type AuthError struct {
 	Message string
+	Code    string // "token_expired", "token_invalid", "server_error"
 }
 
 func (e *AuthError) Error() string {
 	return "authentication failed: " + e.Message
 }
 
+// IsTokenInvalid returns true if the error indicates an invalid token
+func (e *AuthError) IsTokenInvalid() bool {
+	return e.Code == "token_invalid" || e.Message == "Invalid token"
+}
+
 // WebSocket message types
 const (
 	WSMsgTypeCertRequest = "cert_request"
 	WSMsgTypeCertUpdate  = "cert_update"
+	WSMsgTypeTokenUpdate = "token_update"
 )
 
 // WSCertRequestPayload represents a certificate request from master
@@ -898,6 +931,12 @@ type WSCertUpdatePayload struct {
 	Error      string    `json:"error,omitempty"`
 }
 
+// WSTokenUpdatePayload represents a token update from master
+type WSTokenUpdatePayload struct {
+	ServerToken string    `json:"server_token"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
 // handleMessage processes incoming messages from master
 func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 	var msg struct {
@@ -918,6 +957,13 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 			return
 		}
 		go c.handleCertRequest(conn, payload)
+	case WSMsgTypeTokenUpdate:
+		var payload WSTokenUpdatePayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Printf("[Agent] Failed to parse token_update payload: %v", err)
+			return
+		}
+		c.handleTokenUpdate(payload)
 	default:
 		// Ignore unknown message types
 	}
@@ -987,4 +1033,14 @@ func (c *Client) requestCertificate(req WSCertRequestPayload) WSCertUpdatePayloa
 
 	log.Printf("[Agent] Certificate obtained for %s, expires: %s", req.Domain, certResult.ExpiryDate)
 	return result
+}
+
+// handleTokenUpdate processes a token update from master
+func (c *Client) handleTokenUpdate(payload WSTokenUpdatePayload) {
+	log.Printf("[Agent] Received token update from master, new token expires at %s", payload.ExpiresAt.Format(time.RFC3339))
+
+	// Update the token in memory
+	c.config.Token = payload.ServerToken
+
+	log.Printf("[Agent] Token updated successfully in memory")
 }
