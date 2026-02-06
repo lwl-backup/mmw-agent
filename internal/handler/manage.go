@@ -1536,13 +1536,22 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := h.removeInbound(ctx, clients.Handler, req.Tag); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound: %v", err))
-			return
+		// Try to remove from runtime (ignore error if not running)
+		runtimeErr := h.removeInbound(ctx, clients.Handler, req.Tag)
+		if runtimeErr != nil {
+			log.Printf("[Manage] Warning: Failed to remove inbound from runtime: %v", runtimeErr)
 		}
 
-		if err := h.removeInboundFromConfig(req.Tag); err != nil {
-			log.Printf("[Manage] Warning: Failed to remove inbound from config: %v", err)
+		// Remove from config file (this is the primary operation)
+		configErr := h.removeInboundFromConfig(req.Tag)
+		if configErr != nil {
+			log.Printf("[Manage] Warning: Failed to remove inbound from config: %v", configErr)
+		}
+
+		// Success if at least one operation succeeded
+		if runtimeErr != nil && configErr != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound: runtime=%v, config=%v", runtimeErr, configErr))
+			return
 		}
 
 		writeJSON(w, http.StatusOK, map[string]interface{}{
