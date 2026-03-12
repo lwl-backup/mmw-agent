@@ -19,7 +19,6 @@ import (
 	vlessin "github.com/xtls/xray-core/proxy/vless/inbound"
 	"github.com/xtls/xray-core/proxy/vmess"
 	vmessin "github.com/xtls/xray-core/proxy/vmess/inbound"
-	"github.com/xtls/xray-core/proxy/wireguard"
 )
 
 // AddVMessInbound demonstrates HandlerServiceClient.AddInbound for VMess inbound.
@@ -247,28 +246,3 @@ func AddLoopbackInbound(ctx context.Context, client command.HandlerServiceClient
 	return err
 }
 
-// AddWireGuardInbound sets up a WireGuard entry point with a single peer.
-func AddWireGuardInbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32) error {
-	cfg := &wireguard.DeviceConfig{
-		SecretKey:      "yAnExampleSecretKeyBase64==",
-		Endpoint:       []string{":51820"},
-		Mtu:            1420,
-		NumWorkers:     2,
-		DomainStrategy: wireguard.DeviceConfig_FORCE_IP46,
-		Peers: []*wireguard.PeerConfig{
-			{
-				PublicKey:  "peerPublicKeyBase64==",
-				Endpoint:   "203.0.113.1:51820",
-				KeepAlive:  25,
-				AllowedIps: []string{"0.0.0.0/0", "::/0"},
-			},
-		},
-	}
-	inbound := inboundConfig(
-		tag,
-		receiverSettings(port, false),
-		serial.ToTypedMessage(cfg),
-	)
-	_, err := client.AddInbound(ctx, &command.AddInboundRequest{Inbound: inbound})
-	return err
-}

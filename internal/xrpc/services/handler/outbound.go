@@ -19,7 +19,6 @@ import (
 	vlessout "github.com/xtls/xray-core/proxy/vless/outbound"
 	"github.com/xtls/xray-core/proxy/vmess"
 	vmessout "github.com/xtls/xray-core/proxy/vmess/outbound"
-	"github.com/xtls/xray-core/proxy/wireguard"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
@@ -197,25 +196,3 @@ func AddVMessOutbound(ctx context.Context, client command.HandlerServiceClient, 
 	return err
 }
 
-func AddWireGuardOutbound(ctx context.Context, client command.HandlerServiceClient, tag string) error {
-	cfg := outboundConfig(
-		tag,
-		senderSettings(),
-		serial.ToTypedMessage(&wireguard.DeviceConfig{
-			SecretKey:      "clientSecretKeyBase64==",
-			Endpoint:       []string{"198.51.100.2:51820"},
-			IsClient:       true,
-			Mtu:            1420,
-			DomainStrategy: wireguard.DeviceConfig_FORCE_IP4,
-			Peers: []*wireguard.PeerConfig{
-				{
-					PublicKey:  "serverPublicKeyBase64==",
-					AllowedIps: []string{"0.0.0.0/0"},
-					KeepAlive:  30,
-				},
-			},
-		}),
-	)
-	_, err := client.AddOutbound(ctx, &command.AddOutboundRequest{Outbound: cfg})
-	return err
-}
