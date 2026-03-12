@@ -2415,3 +2415,85 @@ func (h *ManageHandler) addAPIRoutingRule(config map[string]interface{}) {
 	}
 	routing["rules"] = append([]interface{}{apiRule}, rules...)
 }
+
+// ================== Certificate Deploy ==================
+
+// CertDeployRequest represents a certificate deploy request from master
+type CertDeployRequest struct {
+	Domain   string `json:"domain"`
+	CertPEM  string `json:"cert_pem"`
+	KeyPEM   string `json:"key_pem"`
+	CertPath string `json:"cert_path"`
+	KeyPath  string `json:"key_path"`
+	Reload   string `json:"reload"` // nginx, xray, both, none
+}
+
+// HandleCertDeploy handles POST /api/child/cert/deploy
+func (h *ManageHandler) HandleCertDeploy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req CertDeployRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.CertPEM == "" || req.KeyPEM == "" || req.CertPath == "" || req.KeyPath == "" {
+		writeError(w, http.StatusBadRequest, "cert_pem, key_pem, cert_path, key_path are required")
+		return
+	}
+
+	if err := deployCertFiles(req.CertPEM, req.KeyPEM, req.CertPath, req.KeyPath, req.Reload); err != nil {
+		log.Printf("[CertDeploy] Failed to deploy cert for %s: %v", req.Domain, err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("deploy failed: %v", err))
+		return
+	}
+
+	log.Printf("[CertDeploy] Successfully deployed cert for %s to %s", req.Domain, req.CertPath)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("certificate for %s deployed", req.Domain),
+	})
+}
+
+func deployCertFiles(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
+	if err := os.MkdirAll(filepath.Dir(certPath), 0755); err != nil {
+		return fmt.Errorf("create cert dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
+		return fmt.Errorf("create key dir: %w", err)
+	}
+	if err := os.WriteFile(certPath, []byte(certPEM), 0644); err != nil {
+		return fmt.Errorf("write cert: %w", err)
+	}
+	if err := os.WriteFile(keyPath, []byte(keyPEM), 0600); err != nil {
+		return fmt.Errorf("write key: %w", err)
+	}
+
+	switch reloadTarget {
+	case "nginx":
+		return runCommand("nginx", "-s", "reload")
+	case "xray":
+		return runCommand("systemctl", "restart", "xray")
+	case "both":
+		if err := runCommand("nginx", "-s", "reload"); err != nil {
+			return err
+		}
+		return runCommand("systemctl", "restart", "xray")
+	}
+	return nil
+}
+
+func runCommand(name string, args ...string) error {
+	if output, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%s: %s: %w", name, string(output), err)
+	}
+	return nil
+}

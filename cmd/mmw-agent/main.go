@@ -74,6 +74,7 @@ func main() {
 	mux.HandleFunc("/api/child/outbounds", manageHandler.HandleOutbounds)
 	mux.HandleFunc("/api/child/routing", manageHandler.HandleRouting)
 	mux.HandleFunc("/api/child/scan", manageHandler.HandleScan)
+	mux.HandleFunc("/api/child/cert/deploy", manageHandler.HandleCertDeploy)
 
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

@@ -10,12 +10,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"mmw-agent/internal/acme"
 	"mmw-agent/internal/collector"
 	"mmw-agent/internal/config"
 
@@ -919,25 +920,9 @@ func (e *AuthError) IsTokenInvalid() bool {
 
 // WebSocket message types
 const (
-	WSMsgTypeCertRequest = "cert_request"
-	WSMsgTypeCertUpdate  = "cert_update"
 	WSMsgTypeCertDeploy  = "cert_deploy"
 	WSMsgTypeTokenUpdate = "token_update"
 )
-
-// WSCertRequestPayload represents a certificate request from master
-type WSCertRequestPayload struct {
-	CertID         int64  `json:"cert_id"`
-	Domain         string `json:"domain"`
-	Email          string `json:"email"`
-	Provider       string `json:"provider"`
-	ChallengeMode  string `json:"challenge_mode"`
-	WebrootPath    string `json:"webroot_path,omitempty"`
-	DNSProvider    string `json:"dns_provider,omitempty"`
-	DNSCredentials string `json:"dns_credentials,omitempty"` // JSON string
-	EABKid         string `json:"eab_kid,omitempty"`
-	EABHmacKey     string `json:"eab_hmac_key,omitempty"`
-}
 
 // WSCertDeployPayload represents a certificate deploy command from master
 type WSCertDeployPayload struct {
@@ -947,20 +932,6 @@ type WSCertDeployPayload struct {
 	CertPath string `json:"cert_path"`
 	KeyPath  string `json:"key_path"`
 	Reload   string `json:"reload"`
-}
-
-// WSCertUpdatePayload represents a certificate update response to master
-type WSCertUpdatePayload struct {
-	CertID     int64     `json:"cert_id"`
-	Domain     string    `json:"domain"`
-	Success    bool      `json:"success"`
-	CertPath   string    `json:"cert_path,omitempty"`
-	KeyPath    string    `json:"key_path,omitempty"`
-	CertPEM    string    `json:"cert_pem,omitempty"`
-	KeyPEM     string    `json:"key_pem,omitempty"`
-	IssueDate  time.Time `json:"issue_date,omitempty"`
-	ExpiryDate time.Time `json:"expiry_date,omitempty"`
-	Error      string    `json:"error,omitempty"`
 }
 
 // WSTokenUpdatePayload represents a token update from master
@@ -982,13 +953,6 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 	}
 
 	switch msg.Type {
-	case WSMsgTypeCertRequest:
-		var payload WSCertRequestPayload
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			log.Printf("[Agent] Failed to parse cert_request payload: %v", err)
-			return
-		}
-		go c.handleCertRequest(conn, payload)
 	case WSMsgTypeCertDeploy:
 		var payload WSCertDeployPayload
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -1008,96 +972,53 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 	}
 }
 
-// handleCertRequest processes a certificate request from master
-func (c *Client) handleCertRequest(conn *websocket.Conn, req WSCertRequestPayload) {
-	log.Printf("[Agent] Received certificate request for domain: %s", req.Domain)
-
-	result := c.requestCertificate(req)
-
-	// Send result back to master
-	payload, _ := json.Marshal(result)
-	msg := map[string]interface{}{
-		"type":    WSMsgTypeCertUpdate,
-		"payload": json.RawMessage(payload),
-	}
-
-	c.wsMu.Lock()
-	err := conn.WriteJSON(msg)
-	c.wsMu.Unlock()
-
-	if err != nil {
-		log.Printf("[Agent] Failed to send cert_update: %v", err)
-	} else {
-		log.Printf("[Agent] Sent cert_update for domain %s, success=%v", req.Domain, result.Success)
-	}
-}
-
-// requestCertificate performs the actual certificate request using ACME
-func (c *Client) requestCertificate(req WSCertRequestPayload) WSCertUpdatePayload {
-	result := WSCertUpdatePayload{
-		CertID: req.CertID,
-		Domain: req.Domain,
-	}
-
-	opts := []acme.ClientOption{}
-	if req.ChallengeMode == "webroot" && req.WebrootPath != "" {
-		opts = append(opts, acme.WithWebrootDir(req.WebrootPath))
-	}
-
-	acmeClient := acme.NewClient(opts...)
-
-	// Build V2 cert request
-	certReq := acme.CertRequest{
-		Email:         req.Email,
-		Domain:        req.Domain,
-		Provider:      req.Provider,
-		ChallengeMode: req.ChallengeMode,
-		WebrootPath:   req.WebrootPath,
-		DNSProvider:   req.DNSProvider,
-		EABKid:        req.EABKid,
-		EABHmacKey:    req.EABHmacKey,
-	}
-
-	// Parse DNS credentials from JSON string
-	if req.DNSCredentials != "" {
-		var creds map[string]string
-		if err := json.Unmarshal([]byte(req.DNSCredentials), &creds); err == nil {
-			certReq.DNSCredentials = creds
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	certResult, err := acmeClient.ObtainCertificateV2(ctx, certReq)
-	if err != nil {
-		result.Success = false
-		result.Error = err.Error()
-		log.Printf("[Agent] Certificate request failed for %s: %v", req.Domain, err)
-		return result
-	}
-
-	result.Success = true
-	result.CertPath = certResult.CertPath
-	result.KeyPath = certResult.KeyPath
-	result.CertPEM = certResult.CertPEM
-	result.KeyPEM = certResult.KeyPEM
-	result.IssueDate = certResult.IssueDate
-	result.ExpiryDate = certResult.ExpiryDate
-
-	log.Printf("[Agent] Certificate obtained for %s, expires: %s", req.Domain, certResult.ExpiryDate)
-	return result
-}
-
 // handleCertDeploy deploys a certificate received from master
 func (c *Client) handleCertDeploy(payload WSCertDeployPayload) {
 	log.Printf("[Agent] Received cert_deploy for domain: %s, target: %s", payload.Domain, payload.Reload)
 
-	if err := acme.Deploy(payload.CertPEM, payload.KeyPEM, payload.CertPath, payload.KeyPath, payload.Reload); err != nil {
+	if err := deployCert(payload.CertPEM, payload.KeyPEM, payload.CertPath, payload.KeyPath, payload.Reload); err != nil {
 		log.Printf("[Agent] cert_deploy failed for %s: %v", payload.Domain, err)
 	} else {
 		log.Printf("[Agent] cert_deploy succeeded for %s", payload.Domain)
 	}
+}
+
+func deployCert(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
+	if certPath == "" || keyPath == "" {
+		return fmt.Errorf("deploy paths are required")
+	}
+	if err := os.MkdirAll(filepath.Dir(certPath), 0755); err != nil {
+		return fmt.Errorf("create cert dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
+		return fmt.Errorf("create key dir: %w", err)
+	}
+	if err := os.WriteFile(certPath, []byte(certPEM), 0644); err != nil {
+		return fmt.Errorf("write cert: %w", err)
+	}
+	if err := os.WriteFile(keyPath, []byte(keyPEM), 0600); err != nil {
+		return fmt.Errorf("write key: %w", err)
+	}
+
+	switch reloadTarget {
+	case "nginx":
+		return runCmd("nginx", "-s", "reload")
+	case "xray":
+		return runCmd("systemctl", "restart", "xray")
+	case "both":
+		if err := runCmd("nginx", "-s", "reload"); err != nil {
+			return err
+		}
+		return runCmd("systemctl", "restart", "xray")
+	}
+	return nil
+}
+
+func runCmd(name string, args ...string) error {
+	if output, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%s: %s: %w", name, string(output), err)
+	}
+	return nil
 }
 
 // handleTokenUpdate processes a token update from master
