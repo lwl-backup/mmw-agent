@@ -301,6 +301,9 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 		log.Printf("[Agent] Failed to send initial heartbeat: %v", err)
 	}
 
+	// Send scan result to master for auto-sync
+	go c.sendScanResult(conn)
+
 	return c.runMessageLoop(ctx, conn)
 }
 
@@ -950,6 +953,7 @@ func (e *AuthError) IsTokenInvalid() bool {
 const (
 	WSMsgTypeCertDeploy  = "cert_deploy"
 	WSMsgTypeTokenUpdate = "token_update"
+	WSMsgTypeScanResult  = "scan_result"
 )
 
 // WSCertDeployPayload represents a certificate deploy command from master
@@ -1030,16 +1034,25 @@ func deployCert(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
 
 	switch reloadTarget {
 	case "nginx":
-		return runCmd("nginx", "-s", "reload")
+		return reloadNginxCmd()
 	case "xray":
 		return runCmd("systemctl", "restart", "xray")
 	case "both":
-		if err := runCmd("nginx", "-s", "reload"); err != nil {
+		if err := reloadNginxCmd(); err != nil {
 			return err
 		}
 		return runCmd("systemctl", "restart", "xray")
 	}
 	return nil
+}
+
+func reloadNginxCmd() error {
+	for _, bin := range []string{"/usr/local/nginx/sbin/nginx", "nginx"} {
+		if path, err := exec.LookPath(bin); err == nil {
+			return runCmd(path, "-s", "reload")
+		}
+	}
+	return runCmd("systemctl", "reload", "nginx")
 }
 
 func runCmd(name string, args ...string) error {
@@ -1057,4 +1070,67 @@ func (c *Client) handleTokenUpdate(payload WSTokenUpdatePayload) {
 	c.config.Token = payload.ServerToken
 
 	log.Printf("[Agent] Token updated successfully in memory")
+}
+
+// sendScanResult scans local xray status and sends results to master
+func (c *Client) sendScanResult(conn *websocket.Conn) {
+	// Check xray running status
+	xrayRunning := false
+	xrayVersion := ""
+	cmd := exec.Command("xray", "version")
+	if out, err := cmd.Output(); err == nil {
+		xrayVersion = strings.TrimSpace(strings.Split(string(out), "\n")[0])
+	}
+	if exec.Command("systemctl", "is-active", "--quiet", "xray").Run() == nil {
+		xrayRunning = true
+	}
+
+	// Read inbounds from config
+	var inbounds []map[string]interface{}
+	configPaths := []string{
+		"/usr/local/etc/xray/config.json",
+		"/etc/xray/config.json",
+	}
+	for _, cfgPath := range configPaths {
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			continue
+		}
+		var config map[string]interface{}
+		if json.Unmarshal(data, &config) != nil {
+			continue
+		}
+		if ibs, ok := config["inbounds"].([]interface{}); ok {
+			for _, ib := range ibs {
+				if m, ok := ib.(map[string]interface{}); ok {
+					if tag, _ := m["tag"].(string); tag == "api" {
+						continue
+					}
+					inbounds = append(inbounds, m)
+				}
+			}
+		}
+		break
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"xray_running": xrayRunning,
+		"xray_version": xrayVersion,
+		"inbounds":     inbounds,
+	})
+
+	msg := map[string]interface{}{
+		"type":    WSMsgTypeScanResult,
+		"payload": json.RawMessage(payload),
+	}
+
+	c.wsMu.Lock()
+	err := conn.WriteJSON(msg)
+	c.wsMu.Unlock()
+
+	if err != nil {
+		log.Printf("[Agent] Failed to send scan_result: %v", err)
+		return
+	}
+	log.Printf("[Agent] Sent scan_result: xray_running=%v, inbounds=%d", xrayRunning, len(inbounds))
 }

@@ -297,6 +297,9 @@ func (h *ManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.Request
 
 	log.Printf("[Manage] Xray installed successfully")
 
+	// Deploy default config if no config exists
+	h.deployDefaultXrayConfig()
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Xray installed successfully",
@@ -2511,6 +2514,31 @@ func runCommand(name string, args ...string) error {
 	return nil
 }
 
+// deployDefaultXrayConfig deploys the embedded default xray config if no config exists.
+func (h *ManageHandler) deployDefaultXrayConfig() {
+	configPath := "/usr/local/etc/xray/config.json"
+	if _, err := os.Stat(configPath); err == nil {
+		// Config already exists — run EnsureXrayConfig to add missing sections
+		result := h.EnsureXrayConfig()
+		if result.Modified {
+			log.Printf("[Manage] Xray config updated after install: added %v", result.AddedSections)
+			exec.Command("systemctl", "restart", "xray").Run()
+		}
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+		log.Printf("[Manage] Failed to create xray config dir: %v", err)
+		return
+	}
+	if err := os.WriteFile(configPath, defaultXrayConfig, 0644); err != nil {
+		log.Printf("[Manage] Failed to write default xray config: %v", err)
+		return
+	}
+	log.Printf("[Manage] Deployed default xray config to %s", configPath)
+	exec.Command("systemctl", "restart", "xray").Run()
+}
+
 // ================== SSE Streaming Install/Remove ==================
 
 func sseStreamCmd(w http.ResponseWriter, r *http.Request, cmd *exec.Cmd, completeMsg string) {
@@ -2600,6 +2628,9 @@ func (h *ManageHandler) HandleXrayInstallStream(w http.ResponseWriter, r *http.R
 		`bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install`)
 	cmd.Env = os.Environ()
 	sseStreamCmd(w, r, cmd, "Xray installed successfully")
+
+	// Deploy default config after install
+	h.deployDefaultXrayConfig()
 }
 
 func (h *ManageHandler) HandleXrayRemoveStream(w http.ResponseWriter, r *http.Request) {
