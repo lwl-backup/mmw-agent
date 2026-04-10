@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"mmw-agent/internal/constants"
 )
 
 type DomainLatencyProbeRequest struct {
@@ -24,7 +26,7 @@ type DomainLatencyProbeResult struct {
 	Error     string `json:"error,omitempty"`
 }
 
-// HandleDomainLatencyProbe handles POST /api/child/domains/latency
+// 处理 POST /api/child/domains/latency 请求。
 func (h *ManageHandler) HandleDomainLatencyProbe(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -49,13 +51,13 @@ func (h *ManageHandler) HandleDomainLatencyProbe(w http.ResponseWriter, r *http.
 
 	timeoutMs := req.TimeoutMs
 	if timeoutMs <= 0 {
-		timeoutMs = 2000
+		timeoutMs = constants.DomainProbeDefaultTimeoutMS
 	}
-	if timeoutMs < 200 {
-		timeoutMs = 200
+	if timeoutMs < constants.DomainProbeMinTimeoutMS {
+		timeoutMs = constants.DomainProbeMinTimeoutMS
 	}
-	if timeoutMs > 10000 {
-		timeoutMs = 10000
+	if timeoutMs > constants.DomainProbeMaxTimeoutMS {
+		timeoutMs = constants.DomainProbeMaxTimeoutMS
 	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 
@@ -64,13 +66,13 @@ func (h *ManageHandler) HandleDomainLatencyProbe(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "no valid domain to probe")
 		return
 	}
-	if len(domains) > 200 {
-		domains = domains[:200]
+	if len(domains) > constants.DomainProbeMaxCount {
+		domains = domains[:constants.DomainProbeMaxCount]
 	}
 
 	results := make([]DomainLatencyProbeResult, 0, len(domains))
 	resultCh := make(chan DomainLatencyProbeResult, len(domains))
-	sem := make(chan struct{}, 16)
+	sem := make(chan struct{}, constants.DomainProbeConcurrency)
 	var wg sync.WaitGroup
 
 	for _, domain := range domains {
@@ -206,7 +208,7 @@ func splitHostPortLoose(input string) (host string, port string, ok bool) {
 		}
 	}
 
-	// Fallback for "domain:443" without brackets handling.
+	// 兼容不带方括号的 "domain:443" 写法。
 	idx := strings.LastIndex(s, ":")
 	if idx <= 0 || idx >= len(s)-1 {
 		return "", "", false

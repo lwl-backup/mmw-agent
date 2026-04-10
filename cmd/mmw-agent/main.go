@@ -8,10 +8,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"mmw-agent/internal/agent"
 	"mmw-agent/internal/config"
+	"mmw-agent/internal/constants"
 	"mmw-agent/internal/handler"
 )
 
@@ -20,19 +20,19 @@ func main() {
 	configPathShort := flag.String("c", "", "Path to config file (shorthand)")
 	flag.Parse()
 
-	// -c takes effect if -config is not set
+	// 仅在 -config 未设置时使用 -c
 	cfgFile := *configPath
 	if cfgFile == "" {
 		cfgFile = *configPathShort
 	}
-	// Default to config.yaml in working directory
+	// 默认读取工作目录下的 config.yaml
 	if cfgFile == "" {
 		if _, err := os.Stat("config.yaml"); err == nil {
 			cfgFile = "config.yaml"
 		}
 	}
 
-	// Load configuration
+	// 加载配置
 	var cfg *config.Config
 	var err error
 
@@ -41,7 +41,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to load config: %v", err)
 		}
-		// Merge environment variables (env takes precedence)
+		// 合并环境变量（环境变量优先）
 		cfg.Merge(config.FromEnv())
 	} else {
 		cfg = config.FromEnv()
@@ -56,72 +56,42 @@ func main() {
 	log.Printf("[Main] Listen port: %s", cfg.ListenPort)
 	log.Printf("[Main] Xray servers: %d configured", len(cfg.XrayServers))
 
-	// Create agent client
+	// 创建 agent 客户端
 	agentClient := agent.NewClient(cfg)
 
-	// Create handlers
+	// 创建处理器
 	apiHandler := handler.NewAPIHandler(agentClient, cfg.Token)
 	manageHandler := handler.NewManageHandler(cfg.Token)
 
-	// Setup HTTP routes
+	// 注册 HTTP 路由
 	mux := http.NewServeMux()
+	handler.RegisterChildRoutes(mux, apiHandler, manageHandler)
 
-	// Pull mode API
-	mux.HandleFunc("/api/child/traffic", apiHandler.ServeHTTP)
-	mux.HandleFunc("/api/child/speed", apiHandler.ServeSpeedHTTP)
-
-	// Management API
-	mux.HandleFunc("/api/child/services/status", manageHandler.HandleServicesStatus)
-	mux.HandleFunc("/api/child/services/control", manageHandler.HandleServiceControl)
-	mux.HandleFunc("/api/child/xray/install", manageHandler.HandleXrayInstall)
-	mux.HandleFunc("/api/child/xray/remove", manageHandler.HandleXrayRemove)
-	mux.HandleFunc("/api/child/xray/config", manageHandler.HandleXrayConfig)
-	mux.HandleFunc("/api/child/xray/system-config", manageHandler.HandleXraySystemConfig)
-	mux.HandleFunc("/api/child/xray/config-files", manageHandler.HandleXrayConfigFiles)
-	mux.HandleFunc("/api/child/nginx/install", manageHandler.HandleNginxInstall)
-	mux.HandleFunc("/api/child/nginx/remove", manageHandler.HandleNginxRemove)
-	mux.HandleFunc("/api/child/nginx/config", manageHandler.HandleNginxConfig)
-	mux.HandleFunc("/api/child/nginx/config-files", manageHandler.HandleNginxConfigFiles)
-	mux.HandleFunc("/api/child/system/info", manageHandler.HandleSystemInfo)
-	mux.HandleFunc("/api/child/inbounds", manageHandler.HandleInbounds)
-	mux.HandleFunc("/api/child/outbounds", manageHandler.HandleOutbounds)
-	mux.HandleFunc("/api/child/routing", manageHandler.HandleRouting)
-	mux.HandleFunc("/api/child/scan", manageHandler.HandleScan)
-	mux.HandleFunc("/api/child/cert/deploy", manageHandler.HandleCertDeploy)
-	mux.HandleFunc("/api/child/nginx/setup-ssl", manageHandler.HandleNginxSetupSSL)
-	mux.HandleFunc("/api/child/domains/latency", manageHandler.HandleDomainLatencyProbe)
-
-	// SSE streaming install/remove
-	mux.HandleFunc("/api/child/xray/install-stream", manageHandler.HandleXrayInstallStream)
-	mux.HandleFunc("/api/child/xray/remove-stream", manageHandler.HandleXrayRemoveStream)
-	mux.HandleFunc("/api/child/nginx/install-stream", manageHandler.HandleNginxInstallStream)
-	mux.HandleFunc("/api/child/nginx/remove-stream", manageHandler.HandleNginxRemoveStream)
-
-	// Health check
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+	// 健康检查
+	mux.HandleFunc(constants.PathHealth, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok","mode":"` + string(agentClient.GetCurrentMode()) + `"}`))
 	})
 
-	// Create HTTP server (no WriteTimeout — SSE streaming needs long-lived connections)
+	// 创建 HTTP 服务（不设置 WriteTimeout，避免影响 SSE 长连接）
 	server := &http.Server{
 		Addr:        ":" + cfg.ListenPort,
 		Handler:     mux,
-		ReadTimeout: 30 * time.Second,
+		ReadTimeout: constants.DefaultReadTimeout,
 	}
 
-	// Setup graceful shutdown
+	// 配置优雅退出
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start agent client
+	// 启动 agent 客户端
 	agentClient.Start(ctx)
 
-	// Start HTTP server
+	// 启动 HTTP 服务
 	go func() {
 		log.Printf("[Main] HTTP server listening on :%s", cfg.ListenPort)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -129,15 +99,15 @@ func main() {
 		}
 	}()
 
-	// Wait for shutdown signal
+	// 等待退出信号
 	sig := <-sigCh
 	log.Printf("[Main] Received signal %v, shutting down...", sig)
 
-	// Graceful shutdown
+	// 优雅退出
 	cancel()
 	agentClient.Stop()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), constants.DefaultShutdownTimeout)
 	defer shutdownCancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {

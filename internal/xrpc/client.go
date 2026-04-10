@@ -11,7 +11,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Clients groups the gRPC stubs that the samples rely on.
+// Clients 汇总当前用到的 gRPC 客户端。
 type Clients struct {
 	Connection *grpc.ClientConn
 	Handler    handlerpb.HandlerServiceClient
@@ -19,7 +19,7 @@ type Clients struct {
 	Stats      statspb.StatsServiceClient
 }
 
-// New establishes an insecure (plaintext) connection against a running Xray API endpoint.
+// 连接到运行中的 Xray API，默认使用明文连接。
 func New(ctx context.Context, addr string, port uint16, dialOpts ...grpc.DialOption) (*Clients, error) {
 	target := fmt.Sprintf("%s:%d", addr, port)
 	opts := []grpc.DialOption{

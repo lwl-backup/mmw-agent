@@ -2,13 +2,14 @@ package stats
 
 import (
 	"context"
-	"time"
+
+	"mmw-agent/internal/constants"
 
 	statspb "github.com/xtls/xray-core/app/stats/command"
 )
 
 func QueryTraffic(ctx context.Context, client statspb.StatsServiceClient, pattern string, reset bool) (int64, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, constants.DefaultRPCShortTimeout)
 	defer cancel()
 	resp, err := client.QueryStats(ctx, &statspb.QueryStatsRequest{
 		Pattern: pattern,
@@ -24,7 +25,7 @@ func QueryTraffic(ctx context.Context, client statspb.StatsServiceClient, patter
 }
 
 func GetSystemStats(ctx context.Context, client statspb.StatsServiceClient) (*statspb.SysStatsResponse, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, constants.DefaultRPCShortTimeout)
 	defer cancel()
 	return client.GetSysStats(ctx, &statspb.SysStatsRequest{})
 }

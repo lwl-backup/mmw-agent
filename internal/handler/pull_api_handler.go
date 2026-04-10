@@ -7,16 +7,16 @@ import (
 	"strings"
 
 	"mmw-agent/internal/agent"
-	"mmw-agent/internal/config"
+	"mmw-agent/internal/constants"
 )
 
-// APIHandler handles API requests from the master server (for pull mode)
+// APIHandler 处理来自主控端的请求（拉取模式）。
 type APIHandler struct {
 	client      *agent.Client
 	configToken string
 }
 
-// NewAPIHandler creates a new API handler
+// 创建 API 处理器。
 func NewAPIHandler(client *agent.Client, configToken string) *APIHandler {
 	return &APIHandler{
 		client:      client,
@@ -24,7 +24,7 @@ func NewAPIHandler(client *agent.Client, configToken string) *APIHandler {
 	}
 }
 
-// ServeHTTP handles the HTTP request for traffic data
+// 返回流量数据。
 func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -32,7 +32,7 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !h.authenticate(r) {
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": false,
@@ -44,7 +44,7 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stats, err := h.client.GetStats()
 	if err != nil {
 		log.Printf("[API] Failed to get stats: %v", err)
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": false,
@@ -53,14 +53,14 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"stats":   stats,
 	})
 }
 
-// ServeSpeedHTTP handles the HTTP request for speed data
+// 返回速率数据。
 func (h *APIHandler) ServeSpeedHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -68,7 +68,7 @@ func (h *APIHandler) ServeSpeedHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !h.authenticate(r) {
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": false,
@@ -79,7 +79,7 @@ func (h *APIHandler) ServeSpeedHTTP(w http.ResponseWriter, r *http.Request) {
 
 	uploadSpeed, downloadSpeed := h.client.GetSpeed()
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":        true,
 		"upload_speed":   uploadSpeed,
@@ -87,9 +87,9 @@ func (h *APIHandler) ServeSpeedHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// authenticate checks if the request is authorized (token + User-Agent)
+// 校验请求身份（token + User-Agent）。
 func (h *APIHandler) authenticate(r *http.Request) bool {
-	if r.Header.Get("User-Agent") != config.AgentUserAgent {
+	if r.Header.Get(constants.HeaderUserAgent) != constants.AgentUserAgent {
 		return false
 	}
 
@@ -97,13 +97,13 @@ func (h *APIHandler) authenticate(r *http.Request) bool {
 		return true
 	}
 
-	auth := r.Header.Get("Authorization")
+	auth := r.Header.Get(constants.HeaderAuthorization)
 	if auth == "" {
 		return false
 	}
 
-	if strings.HasPrefix(auth, "Bearer ") {
-		token := strings.TrimPrefix(auth, "Bearer ")
+	if strings.HasPrefix(auth, constants.BearerPrefix) {
+		token := strings.TrimPrefix(auth, constants.BearerPrefix)
 		return token == h.configToken
 	}
 

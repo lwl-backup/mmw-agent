@@ -13,7 +13,7 @@ import (
 	"github.com/xtls/xray-core/proxy/vmess"
 )
 
-// AddVMessUser demonstrates AlterInbound(AddUserOperation) for VMess.
+// 通过 AlterInbound(AddUserOperation) 为 VMess 入站加用户。
 func AddVMessUser(ctx context.Context, client command.HandlerServiceClient, inboundTag, email string) error {
 	req := &command.AlterInboundRequest{
 		Tag: inboundTag,
@@ -34,7 +34,7 @@ func AddVMessUser(ctx context.Context, client command.HandlerServiceClient, inbo
 	return err
 }
 
-// AddVLESSUser shows how to add VLESS users dynamically.
+// 为 VLESS 入站动态加用户。
 func AddVLESSUser(ctx context.Context, client command.HandlerServiceClient, inboundTag, email string) error {
 	req := &command.AlterInboundRequest{
 		Tag: inboundTag,
@@ -53,7 +53,7 @@ func AddVLESSUser(ctx context.Context, client command.HandlerServiceClient, inbo
 	return err
 }
 
-// AddTrojanUser adds a Trojan password to an inbound handler.
+// 为 Trojan 入站加密码用户。
 func AddTrojanUser(ctx context.Context, client command.HandlerServiceClient, inboundTag, email, password string) error {
 	req := &command.AlterInboundRequest{
 		Tag: inboundTag,
@@ -71,7 +71,7 @@ func AddTrojanUser(ctx context.Context, client command.HandlerServiceClient, inb
 	return err
 }
 
-// AddShadowsocksUser sets up a Shadowsocks AEAD credential.
+// 为 Shadowsocks 入站加 AEAD 凭据。
 func AddShadowsocksUser(ctx context.Context, client command.HandlerServiceClient, inboundTag, email, password string) error {
 	req := &command.AlterInboundRequest{
 		Tag: inboundTag,
@@ -90,7 +90,7 @@ func AddShadowsocksUser(ctx context.Context, client command.HandlerServiceClient
 	return err
 }
 
-// AddShadowsocks2022User covers key rotation for SS2022.
+// 为 SS2022 入站新增用户密钥。
 func AddShadowsocks2022User(ctx context.Context, client command.HandlerServiceClient, inboundTag, email string) error {
 	req := &command.AlterInboundRequest{
 		Tag: inboundTag,
@@ -107,7 +107,7 @@ func AddShadowsocks2022User(ctx context.Context, client command.HandlerServiceCl
 	return err
 }
 
-// RemoveUser removes any user (identified by email) from an inbound.
+// 按邮箱从入站移除用户。
 func RemoveUser(ctx context.Context, client command.HandlerServiceClient, inboundTag, email string) error {
 	req := &command.AlterInboundRequest{
 		Tag: inboundTag,

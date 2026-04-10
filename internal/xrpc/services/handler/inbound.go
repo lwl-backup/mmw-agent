@@ -21,7 +21,7 @@ import (
 	vmessin "github.com/xtls/xray-core/proxy/vmess/inbound"
 )
 
-// AddVMessInbound demonstrates HandlerServiceClient.AddInbound for VMess inbound.
+// 添加 VMess 入站示例。
 func AddVMessInbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32) error {
 	inbound := inboundConfig(
 		tag,
@@ -46,7 +46,7 @@ func AddVMessInbound(ctx context.Context, client command.HandlerServiceClient, t
 	return err
 }
 
-// AddVLESSInbound adds a VLESS inbound with Vision style fallbacks.
+// 添加带 Vision 回落配置的 VLESS 入站。
 func AddVLESSInbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32) error {
 	inbound := inboundConfig(
 		tag,
@@ -80,7 +80,7 @@ func AddVLESSInbound(ctx context.Context, client command.HandlerServiceClient, t
 	return err
 }
 
-// AddTrojanInbound registers a Trojan inbound with two users and ALPN fallback.
+// 添加带双用户和 ALPN 回落的 Trojan 入站。
 func AddTrojanInbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32) error {
 	inbound := inboundConfig(
 		tag,
@@ -115,7 +115,7 @@ func AddTrojanInbound(ctx context.Context, client command.HandlerServiceClient, 
 	return err
 }
 
-// AddShadowsocksInbound adds an AEAD Shadowsocks inbound supporting both TCP and UDP.
+// 添加支持 TCP/UDP 的 AEAD Shadowsocks 入站。
 func AddShadowsocksInbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32) error {
 	inbound := inboundConfig(
 		tag,
@@ -137,7 +137,7 @@ func AddShadowsocksInbound(ctx context.Context, client command.HandlerServiceCli
 	return err
 }
 
-// AddShadowsocks2022Inbound covers both single user and multi-user deployment.
+// 添加 Shadowsocks 2022 入站，兼容单用户和多用户场景。
 func AddShadowsocks2022Inbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32) error {
 	server := &ss2022.MultiUserServerConfig{
 		Method: "2022-blake3-aes-128-gcm",
@@ -168,7 +168,7 @@ func AddShadowsocks2022Inbound(ctx context.Context, client command.HandlerServic
 	return err
 }
 
-// AddSocksInbound exposes a SOCKS5 server with username/password authentication.
+// 添加带账号密码认证的 SOCKS5 入站。
 func AddSocksInbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32) error {
 	inbound := inboundConfig(
 		tag,
@@ -184,7 +184,7 @@ func AddSocksInbound(ctx context.Context, client command.HandlerServiceClient, t
 	return err
 }
 
-// AddHTTPInbound adds an HTTP proxy inbound with basic auth.
+// 添加带基础认证的 HTTP 入站。
 func AddHTTPInbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32) error {
 	inbound := inboundConfig(
 		tag,
@@ -199,7 +199,7 @@ func AddHTTPInbound(ctx context.Context, client command.HandlerServiceClient, ta
 	return err
 }
 
-// AddDokodemoInbound configures a dokodemo-door mirror port.
+// 添加 dokodemo-door 入站并转发到目标端口。
 func AddDokodemoInbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32, targetPort uint32) error {
 	inbound := inboundConfig(
 		tag,
@@ -216,7 +216,7 @@ func AddDokodemoInbound(ctx context.Context, client command.HandlerServiceClient
 	return err
 }
 
-// AddDNSInbound exposes the built-in DNS server on an API port.
+// 添加内置 DNS 入站。
 func AddDNSInbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32) error {
 	inbound := inboundConfig(
 		tag,
@@ -235,7 +235,7 @@ func AddDNSInbound(ctx context.Context, client command.HandlerServiceClient, tag
 	return err
 }
 
-// AddLoopbackInbound ties an inbound to an existing outbound chain.
+// 添加 loopback 入站并绑定已有出站链路。
 func AddLoopbackInbound(ctx context.Context, client command.HandlerServiceClient, tag string, port uint32, targetInbound string) error {
 	inbound := inboundConfig(
 		tag,
@@ -245,4 +245,3 @@ func AddLoopbackInbound(ctx context.Context, client command.HandlerServiceClient
 	_, err := client.AddInbound(ctx, &command.AddInboundRequest{Inbound: inbound})
 	return err
 }
-

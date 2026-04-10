@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"mmw-agent/internal/config"
+	"mmw-agent/internal/constants"
 	"mmw-agent/internal/xrpc"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
@@ -26,21 +26,21 @@ import (
 
 var nginxInstalling atomic.Bool
 
-// ManageHandler handles management API requests for child servers
+// ManageHandler 处理子端管理接口请求。
 type ManageHandler struct {
 	configToken string
 }
 
-// NewManageHandler creates a new management handler
+// 创建管理处理器。
 func NewManageHandler(configToken string) *ManageHandler {
 	return &ManageHandler{
 		configToken: configToken,
 	}
 }
 
-// authenticate checks if the request is authorized (token + User-Agent)
+// 校验请求身份（token + User-Agent）。
 func (h *ManageHandler) authenticate(r *http.Request) bool {
-	if r.Header.Get("User-Agent") != config.AgentUserAgent {
+	if r.Header.Get(constants.HeaderUserAgent) != constants.AgentUserAgent {
 		return false
 	}
 
@@ -48,30 +48,30 @@ func (h *ManageHandler) authenticate(r *http.Request) bool {
 		return true
 	}
 
-	auth := r.Header.Get("Authorization")
+	auth := r.Header.Get(constants.HeaderAuthorization)
 	if auth == "" {
-		auth = r.Header.Get("MM-Remote-Token")
+		auth = r.Header.Get(constants.HeaderMMRemoteToken)
 	}
 	if auth == "" {
 		return false
 	}
 
-	if strings.HasPrefix(auth, "Bearer ") {
-		token := strings.TrimPrefix(auth, "Bearer ")
+	if strings.HasPrefix(auth, constants.BearerPrefix) {
+		token := strings.TrimPrefix(auth, constants.BearerPrefix)
 		return token == h.configToken
 	}
 
 	return auth == h.configToken
 }
 
-// writeJSON writes JSON response
+// 输出 JSON 响应。
 func writeJSON(w http.ResponseWriter, statusCode int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(data)
 }
 
-// writeError writes error response
+// 输出错误响应。
 func writeError(w http.ResponseWriter, statusCode int, message string) {
 	writeJSON(w, statusCode, map[string]interface{}{
 		"success": false,
@@ -79,23 +79,23 @@ func writeError(w http.ResponseWriter, statusCode int, message string) {
 	})
 }
 
-// ================== System Services Status ==================
+// ================== 系统服务状态 ==================
 
-// ServicesStatusResponse represents the response for services status
+// ServicesStatusResponse 表示服务状态查询响应。
 type ServicesStatusResponse struct {
 	Success bool           `json:"success"`
 	Xray    *ServiceStatus `json:"xray,omitempty"`
 	Nginx   *ServiceStatus `json:"nginx,omitempty"`
 }
 
-// ServiceStatus represents a service status
+// ServiceStatus 表示单个服务状态。
 type ServiceStatus struct {
 	Installed bool   `json:"installed"`
 	Running   bool   `json:"running"`
 	Version   string `json:"version,omitempty"`
 }
 
-// HandleServicesStatus handles GET /api/child/services/status
+// 处理 GET /api/child/services/status。
 func (h *ManageHandler) HandleServicesStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -121,8 +121,7 @@ func (h *ManageHandler) getXrayStatus() *ServiceStatus {
 
 	xrayPath, err := exec.LookPath("xray")
 	if err != nil {
-		commonPaths := []string{"/usr/local/bin/xray", "/usr/bin/xray", "/opt/xray/xray"}
-		for _, p := range commonPaths {
+		for _, p := range constants.XrayBinarySearchPaths {
 			if _, err := os.Stat(p); err == nil {
 				xrayPath = p
 				break
@@ -142,7 +141,7 @@ func (h *ManageHandler) getXrayStatus() *ServiceStatus {
 		}
 	}
 
-	// Check systemctl first
+	// 优先使用 systemctl 检查
 	cmd := exec.Command("systemctl", "is-active", "xray")
 	output, _ := cmd.Output()
 	if strings.TrimSpace(string(output)) == "active" {
@@ -150,14 +149,14 @@ func (h *ManageHandler) getXrayStatus() *ServiceStatus {
 		return status
 	}
 
-	// Fallback: check if xray process is running via pgrep
+	// 兜底：用 pgrep 检查 xray 进程
 	pgrepCmd := exec.Command("pgrep", "-x", "xray")
 	if err := pgrepCmd.Run(); err == nil {
 		status.Running = true
 		return status
 	}
 
-	// Fallback: check via ps for processes containing "xray"
+	// 兜底：用 ps 检查包含 "xray" 的进程
 	psCmd := exec.Command("bash", "-c", "ps aux | grep -v grep | grep -E '[x]ray' | head -1")
 	if output, err := psCmd.Output(); err == nil && len(strings.TrimSpace(string(output))) > 0 {
 		status.Running = true
@@ -169,12 +168,17 @@ func (h *ManageHandler) getXrayStatus() *ServiceStatus {
 func (h *ManageHandler) getNginxStatus() *ServiceStatus {
 	status := &ServiceStatus{}
 
-	// Check PATH first, then compiled install path
+	// 先查 PATH，再查编译安装路径
 	nginxPath, err := exec.LookPath("nginx")
 	if err != nil {
-		if _, statErr := os.Stat("/usr/local/nginx/sbin/nginx"); statErr == nil {
-			nginxPath = "/usr/local/nginx/sbin/nginx"
-			err = nil
+		for _, candidate := range constants.NginxBinarySearchPaths {
+			if strings.Contains(candidate, "/") {
+				if _, statErr := os.Stat(candidate); statErr == nil {
+					nginxPath = candidate
+					err = nil
+					break
+				}
+			}
 		}
 	}
 	if err == nil {
@@ -190,7 +194,7 @@ func (h *ManageHandler) getNginxStatus() *ServiceStatus {
 		status.Version = "安装中..."
 	}
 
-	// Check systemctl first
+	// 优先使用 systemctl 检查
 	cmd := exec.Command("systemctl", "is-active", "nginx")
 	output, _ := cmd.Output()
 	if strings.TrimSpace(string(output)) == "active" {
@@ -198,14 +202,14 @@ func (h *ManageHandler) getNginxStatus() *ServiceStatus {
 		return status
 	}
 
-	// Fallback: check if nginx process is running via pgrep
+	// 兜底：用 pgrep 检查 nginx 进程
 	pgrepCmd := exec.Command("pgrep", "-x", "nginx")
 	if err := pgrepCmd.Run(); err == nil {
 		status.Running = true
 		return status
 	}
 
-	// Fallback: check via ps for nginx master process
+	// 兜底：用 ps 检查 nginx master 进程
 	psCmd := exec.Command("bash", "-c", "ps aux | grep -v grep | grep -E 'nginx: master' | head -1")
 	if output, err := psCmd.Output(); err == nil && len(strings.TrimSpace(string(output))) > 0 {
 		status.Running = true
@@ -214,15 +218,15 @@ func (h *ManageHandler) getNginxStatus() *ServiceStatus {
 	return status
 }
 
-// ================== Service Control ==================
+// ================== 服务控制 ==================
 
-// ServiceControlRequest represents a service control request
+// ServiceControlRequest 表示服务控制请求。
 type ServiceControlRequest struct {
 	Service string `json:"service"`
 	Action  string `json:"action"`
 }
 
-// HandleServiceControl handles POST /api/child/services/control
+// 处理 POST /api/child/services/control。
 func (h *ManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -265,9 +269,9 @@ func (h *ManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// ================== Xray Installation ==================
+// ================== Xray 安装 ==================
 
-// HandleXrayInstall handles POST /api/child/xray/install
+// 处理 POST /api/child/xray/install。
 func (h *ManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -297,7 +301,7 @@ func (h *ManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.Request
 
 	log.Printf("[Manage] Xray installed successfully")
 
-	// Deploy default config if no config exists
+	// 若无配置则下发默认配置
 	h.deployDefaultXrayConfig()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -307,7 +311,7 @@ func (h *ManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// HandleXrayRemove handles POST /api/child/xray/remove
+// 处理 POST /api/child/xray/remove。
 func (h *ManageHandler) HandleXrayRemove(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -344,9 +348,9 @@ func (h *ManageHandler) HandleXrayRemove(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// ================== Xray Configuration ==================
+// ================== Xray 配置 ==================
 
-// HandleXrayConfig handles GET/POST /api/child/xray/config
+// 处理 GET/POST /api/child/xray/config。
 func (h *ManageHandler) HandleXrayConfig(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticate(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
@@ -364,11 +368,7 @@ func (h *ManageHandler) HandleXrayConfig(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *ManageHandler) getXrayConfig(w http.ResponseWriter, r *http.Request) {
-	configPaths := []string{
-		"/usr/local/etc/xray/config.json",
-		"/etc/xray/config.json",
-		"/opt/xray/config.json",
-	}
+	configPaths := constants.DefaultXrayConfigPaths
 
 	var configPath string
 	var content []byte
@@ -413,7 +413,7 @@ func (h *ManageHandler) setXrayConfig(w http.ResponseWriter, r *http.Request) {
 
 	configPath := req.Path
 	if configPath == "" {
-		configPath = "/usr/local/etc/xray/config.json"
+		configPath = constants.DefaultXrayConfigPaths[0]
 	}
 
 	dir := filepath.Dir(configPath)
@@ -436,9 +436,9 @@ func (h *ManageHandler) setXrayConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ================== Xray System Configuration ==================
+// ================== Xray 系统配置 ==================
 
-// XraySystemConfig represents the system configuration state
+// XraySystemConfig 表示 Xray 系统配置状态。
 type XraySystemConfig struct {
 	MetricsEnabled bool   `json:"metrics_enabled"`
 	MetricsListen  string `json:"metrics_listen"`
@@ -447,7 +447,7 @@ type XraySystemConfig struct {
 	GrpcPort       int    `json:"grpc_port"`
 }
 
-// HandleXraySystemConfig handles GET/POST /api/child/xray/system-config
+// 处理 GET/POST /api/child/xray/system-config。
 func (h *ManageHandler) HandleXraySystemConfig(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticate(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
@@ -484,7 +484,7 @@ func (h *ManageHandler) getXraySystemConfig(w http.ResponseWriter, r *http.Reque
 	}
 
 	sysConfig := &XraySystemConfig{
-		MetricsListen: "127.0.0.1:38889",
+		MetricsListen: constants.DefaultMetricsListen,
 		GrpcPort:      46736,
 	}
 
@@ -605,10 +605,10 @@ func (h *ManageHandler) updateXraySystemConfig(w http.ResponseWriter, r *http.Re
 				apiInbound := map[string]interface{}{
 					"tag":      "api",
 					"port":     float64(req.GrpcPort),
-					"listen":   "127.0.0.1",
+					"listen":   constants.LocalhostIP,
 					"protocol": "dokodemo-door",
 					"settings": map[string]interface{}{
-						"address": "127.0.0.1",
+						"address": constants.LocalhostIP,
 					},
 				}
 				config["inbounds"] = append([]interface{}{apiInbound}, inbounds...)
@@ -618,10 +618,10 @@ func (h *ManageHandler) updateXraySystemConfig(w http.ResponseWriter, r *http.Re
 				map[string]interface{}{
 					"tag":      "api",
 					"port":     float64(req.GrpcPort),
-					"listen":   "127.0.0.1",
+					"listen":   constants.LocalhostIP,
 					"protocol": "dokodemo-door",
 					"settings": map[string]interface{}{
-						"address": "127.0.0.1",
+						"address": constants.LocalhostIP,
 					},
 				},
 			}
@@ -722,9 +722,9 @@ func (h *ManageHandler) removeAPIRoutingRule(config map[string]interface{}) {
 	routing["rules"] = newRules
 }
 
-// ================== Nginx Installation ==================
+// ================== Nginx 安装 ==================
 
-// HandleNginxInstall handles POST /api/child/nginx/install
+// 处理 POST /api/child/nginx/install。
 func (h *ManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -777,7 +777,7 @@ func (h *ManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// HandleNginxRemove handles POST /api/child/nginx/remove
+// 处理 POST /api/child/nginx/remove。
 func (h *ManageHandler) HandleNginxRemove(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -814,9 +814,9 @@ func (h *ManageHandler) HandleNginxRemove(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// ================== Nginx Configuration ==================
+// ================== Nginx 配置 ==================
 
-// HandleNginxConfig handles GET/POST /api/child/nginx/config
+// 处理 GET/POST /api/child/nginx/config。
 func (h *ManageHandler) HandleNginxConfig(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticate(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
@@ -834,10 +834,7 @@ func (h *ManageHandler) HandleNginxConfig(w http.ResponseWriter, r *http.Request
 }
 
 func (h *ManageHandler) getNginxConfig(w http.ResponseWriter, r *http.Request) {
-	configPaths := []string{
-		"/etc/nginx/nginx.conf",
-		"/usr/local/nginx/conf/nginx.conf",
-	}
+	configPaths := constants.DefaultNginxConfigPaths
 
 	var configPath string
 	var content []byte
@@ -876,7 +873,7 @@ func (h *ManageHandler) setNginxConfig(w http.ResponseWriter, r *http.Request) {
 
 	configPath := req.Path
 	if configPath == "" {
-		configPath = "/etc/nginx/nginx.conf"
+		configPath = constants.DefaultNginxConfigPaths[0]
 	}
 
 	backupPath := configPath + ".bak." + time.Now().Format("20060102150405")
@@ -908,9 +905,9 @@ func (h *ManageHandler) setNginxConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ================== System Info ==================
+// ================== 系统信息 ==================
 
-// HandleSystemInfo handles GET /api/child/system/info
+// 处理 GET /api/child/system/info。
 func (h *ManageHandler) HandleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -960,9 +957,9 @@ func (h *ManageHandler) HandleSystemInfo(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, info)
 }
 
-// ================== Config Files Management ==================
+// ================== 配置文件管理 ==================
 
-// ConfigFileInfo represents a config file entry
+// ConfigFileInfo 表示配置文件条目。
 type ConfigFileInfo struct {
 	Name    string `json:"name"`
 	Path    string `json:"path"`
@@ -970,7 +967,7 @@ type ConfigFileInfo struct {
 	ModTime string `json:"mod_time"`
 }
 
-// HandleXrayConfigFiles handles listing and managing xray config files
+// 处理 xray 配置文件的列表与读写。
 func (h *ManageHandler) HandleXrayConfigFiles(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticate(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
@@ -993,11 +990,7 @@ func (h *ManageHandler) HandleXrayConfigFiles(w http.ResponseWriter, r *http.Req
 }
 
 func (h *ManageHandler) listXrayConfigFiles(w http.ResponseWriter, r *http.Request) {
-	configDirs := []string{
-		"/usr/local/etc/xray",
-		"/etc/xray",
-		"/opt/xray",
-	}
+	configDirs := constants.XrayConfigDirPaths
 
 	var files []ConfigFileInfo
 	var baseDir string
@@ -1043,9 +1036,9 @@ func (h *ManageHandler) getXrayConfigFile(w http.ResponseWriter, r *http.Request
 	file = filepath.Clean(file)
 
 	configDirs := []string{
-		"/usr/local/etc/xray",
-		"/etc/xray",
-		"/opt/xray",
+		constants.XrayConfigDirPaths[0],
+		constants.XrayConfigDirPaths[1],
+		constants.XrayConfigDirPaths[2],
 	}
 
 	var filePath string
@@ -1100,9 +1093,9 @@ func (h *ManageHandler) saveXrayConfigFile(w http.ResponseWriter, r *http.Reques
 	}
 
 	configDirs := []string{
-		"/usr/local/etc/xray",
-		"/etc/xray",
-		"/opt/xray",
+		constants.XrayConfigDirPaths[0],
+		constants.XrayConfigDirPaths[1],
+		constants.XrayConfigDirPaths[2],
 	}
 
 	var configDir string
@@ -1114,7 +1107,7 @@ func (h *ManageHandler) saveXrayConfigFile(w http.ResponseWriter, r *http.Reques
 	}
 
 	if configDir == "" {
-		configDir = "/usr/local/etc/xray"
+		configDir = constants.XrayConfigDirPaths[0]
 		if err := os.MkdirAll(configDir, 0755); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to create config directory: %v", err))
 			return
@@ -1145,7 +1138,7 @@ func (h *ManageHandler) saveXrayConfigFile(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// HandleNginxConfigFiles handles listing and managing nginx config files
+// 处理 nginx 配置文件的列表与读写。
 func (h *ManageHandler) HandleNginxConfigFiles(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticate(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
@@ -1172,10 +1165,10 @@ func (h *ManageHandler) listNginxConfigFiles(w http.ResponseWriter, r *http.Requ
 		dir         string
 		description string
 	}{
-		{"/etc/nginx", "main"},
-		{"/etc/nginx/sites-available", "sites-available"},
-		{"/etc/nginx/sites-enabled", "sites-enabled"},
-		{"/etc/nginx/conf.d", "conf.d"},
+		{constants.NginxConfigDirPaths[0], "main"},
+		{constants.NginxConfigDirPaths[1], "sites-available"},
+		{constants.NginxConfigDirPaths[2], "sites-enabled"},
+		{constants.NginxConfigDirPaths[3], "conf.d"},
 	}
 
 	result := make(map[string][]ConfigFileInfo)
@@ -1218,11 +1211,11 @@ func (h *ManageHandler) getNginxConfigFile(w http.ResponseWriter, r *http.Reques
 	file = filepath.Clean(file)
 
 	allowedDirs := []string{
-		"/etc/nginx",
-		"/etc/nginx/sites-available",
-		"/etc/nginx/sites-enabled",
-		"/etc/nginx/conf.d",
-		"/usr/local/nginx/conf",
+		constants.NginxConfigDirPaths[0],
+		constants.NginxConfigDirPaths[1],
+		constants.NginxConfigDirPaths[2],
+		constants.NginxConfigDirPaths[3],
+		constants.NginxConfigDirPaths[4],
 	}
 
 	var filePath string
@@ -1283,8 +1276,8 @@ func (h *ManageHandler) saveNginxConfigFile(w http.ResponseWriter, r *http.Reque
 	req.Path = filepath.Clean(req.Path)
 
 	allowedDirs := []string{
-		"/etc/nginx",
-		"/usr/local/nginx/conf",
+		constants.NginxConfigDirPaths[0],
+		constants.NginxConfigDirPaths[4],
 	}
 
 	allowed := false
@@ -1338,16 +1331,16 @@ func (h *ManageHandler) saveNginxConfigFile(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// ================== Xray Inbounds Management ==================
+// ================== Xray 入站管理 ==================
 
-// InboundRequest represents inbound management request
+// InboundRequest 表示入站管理请求。
 type InboundRequest struct {
 	Action  string                 `json:"action"`
 	Inbound map[string]interface{} `json:"inbound,omitempty"`
 	Tag     string                 `json:"tag,omitempty"`
 }
 
-// HandleInbounds handles inbound management
+// 处理入站管理请求。
 func (h *ManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticate(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
@@ -1412,7 +1405,7 @@ func (h *ManageHandler) getInboundTagsFromGRPC() []string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	clients, err := xrpc.New(ctx, "127.0.0.1", uint16(apiPort))
+	clients, err := xrpc.New(ctx, constants.LocalhostIP, uint16(apiPort))
 	if err != nil {
 		log.Printf("[Manage] Failed to connect to Xray gRPC: %v", err)
 		return nil
@@ -1517,7 +1510,7 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	clients, err := xrpc.New(ctx, "127.0.0.1", uint16(apiPort))
+	clients, err := xrpc.New(ctx, constants.LocalhostIP, uint16(apiPort))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to connect to Xray: %v", err))
 		return
@@ -1557,27 +1550,27 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Try to remove from runtime (ignore error if not running)
+		// 尝试从运行态移除（未运行时报错可忽略）
 		runtimeErr := h.removeInbound(ctx, clients.Handler, req.Tag)
 		if runtimeErr != nil {
 			log.Printf("[Manage] Warning: Failed to remove inbound from runtime: %v", runtimeErr)
 		}
 
-		// Remove from config file (this is the primary operation)
+		// 从配置文件移除（主流程）
 		configErr := h.removeInboundFromConfig(req.Tag)
 		if configErr != nil {
 			log.Printf("[Manage] Warning: Failed to remove inbound from config: %v", configErr)
 		}
 
-		// Success if config operation succeeded (runtime removal is optional)
-		// The inbound might not exist in runtime if Xray wasn't restarted after config change
+		// 配置文件操作成功即可视为成功（运行态移除可选）
+		// 配置改动后若未重启，运行态可能还没有该入站
 		if configErr != nil {
-			// Config file operation failed
+			// 配置文件操作失败
 			if runtimeErr != nil {
-				// Both failed - check if it's just "not found" errors
+				// 两边都失败时，判断是否只是“未找到”错误
 				if strings.Contains(runtimeErr.Error(), "not enough information") {
-					// Xray says the inbound doesn't exist in runtime, which is fine
-					// Just report config error
+					// Xray 返回运行态不存在该入站，这属于可接受情况
+					// 仅返回配置文件错误
 					writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound from config: %v", configErr))
 				} else {
 					writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound: runtime=%v, config=%v", runtimeErr, configErr))
@@ -1588,7 +1581,7 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Config succeeded, runtime error is acceptable (inbound might not be loaded)
+		// 配置成功时，运行态报错可接受（可能尚未加载）
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Inbound removed successfully",
@@ -1599,16 +1592,16 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ================== Xray Outbounds Management ==================
+// ================== Xray 出站管理 ==================
 
-// OutboundRequest represents outbound management request
+// OutboundRequest 表示出站管理请求。
 type OutboundRequest struct {
 	Action   string                 `json:"action"`
 	Outbound map[string]interface{} `json:"outbound,omitempty"`
 	Tag      string                 `json:"tag,omitempty"`
 }
 
-// HandleOutbounds handles outbound management
+// 处理出站管理请求。
 func (h *ManageHandler) HandleOutbounds(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticate(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
@@ -1673,7 +1666,7 @@ func (h *ManageHandler) manageOutbound(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	clients, err := xrpc.New(ctx, "127.0.0.1", uint16(apiPort))
+	clients, err := xrpc.New(ctx, constants.LocalhostIP, uint16(apiPort))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to connect to Xray: %v", err))
 		return
@@ -1726,9 +1719,9 @@ func (h *ManageHandler) manageOutbound(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ================== Xray Routing Management ==================
+// ================== Xray 路由管理 ==================
 
-// RoutingRequest represents routing management request
+// RoutingRequest 表示路由管理请求。
 type RoutingRequest struct {
 	Action  string                 `json:"action"`
 	Routing map[string]interface{} `json:"routing,omitempty"`
@@ -1736,7 +1729,7 @@ type RoutingRequest struct {
 	Index   int                    `json:"index,omitempty"`
 }
 
-// HandleRouting handles routing management
+// 处理路由管理请求。
 func (h *ManageHandler) HandleRouting(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticate(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
@@ -1871,14 +1864,10 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ================== Helper Functions ==================
+// ================== 辅助函数 ==================
 
 func (h *ManageHandler) findXrayConfigPath() string {
-	configPaths := []string{
-		"/usr/local/etc/xray/config.json",
-		"/etc/xray/config.json",
-		"/opt/xray/config.json",
-	}
+	configPaths := constants.DefaultXrayConfigPaths
 
 	for _, p := range configPaths {
 		if _, err := os.Stat(p); err == nil {
@@ -2124,9 +2113,9 @@ func (h *ManageHandler) removeOutboundFromConfig(tag string) error {
 	return os.WriteFile(configPath, newContent, 0644)
 }
 
-// ================== Scan ==================
+// ================== 扫描 ==================
 
-// ScanResponse represents the response for scan operation
+// ScanResponse 表示扫描接口响应。
 type ScanResponse struct {
 	Success             bool                     `json:"success"`
 	Message             string                   `json:"message"`
@@ -2139,7 +2128,7 @@ type ScanResponse struct {
 	ConfigAddedSections []string                 `json:"config_added_sections,omitempty"`
 }
 
-// HandleScan handles POST /api/child/scan
+// 处理 POST /api/child/scan。
 func (h *ManageHandler) HandleScan(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -2220,9 +2209,9 @@ func (h *ManageHandler) HandleScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-// ================== Xray Config Auto-Complete ==================
+// ================== Xray 配置自动补全 ==================
 
-// EnsureXrayConfigResult holds the result of config check
+// EnsureXrayConfigResult 表示配置检查结果。
 type EnsureXrayConfigResult struct {
 	ConfigPath    string   `json:"config_path"`
 	Modified      bool     `json:"modified"`
@@ -2230,7 +2219,7 @@ type EnsureXrayConfigResult struct {
 	Error         string   `json:"error,omitempty"`
 }
 
-// EnsureXrayConfig checks and completes Xray configuration
+// 检查并补全 Xray 配置。
 func (h *ManageHandler) EnsureXrayConfig() *EnsureXrayConfigResult {
 	result := &EnsureXrayConfigResult{}
 
@@ -2279,7 +2268,7 @@ func (h *ManageHandler) EnsureXrayConfig() *EnsureXrayConfigResult {
 	if _, ok := config["metrics"]; !ok {
 		config["metrics"] = map[string]interface{}{
 			"tag":    "Metrics",
-			"listen": "127.0.0.1:38889",
+			"listen": constants.DefaultMetricsListen,
 		}
 		result.AddedSections = append(result.AddedSections, "metrics")
 		modified = true
@@ -2376,10 +2365,10 @@ func (h *ManageHandler) addAPIInbound(config map[string]interface{}) {
 	apiInbound := map[string]interface{}{
 		"tag":      "api",
 		"port":     float64(46736),
-		"listen":   "127.0.0.1",
+		"listen":   constants.LocalhostIP,
 		"protocol": "dokodemo-door",
 		"settings": map[string]interface{}{
-			"address": "127.0.0.1",
+			"address": constants.LocalhostIP,
 		},
 	}
 
@@ -2432,9 +2421,9 @@ func (h *ManageHandler) addAPIRoutingRule(config map[string]interface{}) {
 	routing["rules"] = append([]interface{}{apiRule}, rules...)
 }
 
-// ================== Certificate Deploy ==================
+// ================== 证书部署 ==================
 
-// CertDeployRequest represents a certificate deploy request from master
+// CertDeployRequest 表示主控端下发的证书部署请求。
 type CertDeployRequest struct {
 	Domain   string `json:"domain"`
 	CertPEM  string `json:"cert_pem"`
@@ -2444,7 +2433,7 @@ type CertDeployRequest struct {
 	Reload   string `json:"reload"` // nginx, xray, both, none
 }
 
-// HandleCertDeploy handles POST /api/child/cert/deploy
+// 处理 POST /api/child/cert/deploy。
 func (h *ManageHandler) HandleCertDeploy(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -2513,9 +2502,9 @@ func deployNginxSSLConfig(domain string) {
 		return
 	}
 
-	confDir := "/usr/local/nginx/conf"
+	confDir := constants.NginxConfigDirPaths[4]
 	if _, err := os.Stat(confDir); err != nil {
-		confDir = "/etc/nginx"
+		confDir = constants.NginxConfigDirPaths[0]
 	}
 
 	certDir := filepath.Join(confDir, "cert")
@@ -2539,7 +2528,7 @@ func deployNginxSSLConfig(domain string) {
 }
 `, domain, domain, domain)
 
-	// Write to conf.d or append via include
+	// 写入 conf.d，或通过 include 挂载
 	confDDir := filepath.Join(confDir, "conf.d")
 	os.MkdirAll(confDDir, 0755)
 	sslConfPath := filepath.Join(confDDir, "ssl.conf")
@@ -2549,7 +2538,7 @@ func deployNginxSSLConfig(domain string) {
 		return
 	}
 
-	// Ensure main nginx.conf includes conf.d/*.conf
+	// 确保主 nginx.conf 包含 conf.d/*.conf
 	mainConf := filepath.Join(confDir, "nginx.conf")
 	content, err := os.ReadFile(mainConf)
 	if err != nil {
@@ -2559,7 +2548,7 @@ func deployNginxSSLConfig(domain string) {
 
 	includeDirective := "include conf.d/*.conf;"
 	if !strings.Contains(string(content), includeDirective) {
-		// Insert include before the last closing brace of http block
+		// 在 http 块最后一个右括号前插入 include
 		text := string(content)
 		lastBrace := strings.LastIndex(text, "}")
 		if lastBrace > 0 {
@@ -2574,8 +2563,8 @@ func deployNginxSSLConfig(domain string) {
 	log.Printf("[Manage] Nginx SSL config deployed for domain %s at %s", domain, sslConfPath)
 }
 
-// HandleNginxSetupSSL handles POST /api/child/nginx/setup-ssl
-// Deploys nginx.conf + domain server block to servers/{domain}.conf.
+// HandleNginxSetupSSL 处理 POST /api/child/nginx/setup-ssl。
+// 部署 nginx.conf 和 servers/{domain}.conf。
 func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -2598,17 +2587,17 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 
 	domain := strings.ToLower(strings.TrimSpace(req.Domain))
 
-	confDir := "/usr/local/nginx"
+	confDir := constants.NginxPrimaryPrefixDir
 	if _, err := os.Stat(confDir); err != nil {
-		confDir = "/etc/nginx"
+		confDir = constants.NginxConfigDirPaths[0]
 	}
 
-	// Ensure cert and servers directories exist
+	// 确保证书和 servers 目录存在
 	os.MkdirAll(filepath.Join(confDir, "cert"), 0755)
 	os.MkdirAll(filepath.Join(confDir, "servers"), 0755)
 
 	if req.NginxConfig != "" {
-		// Deploy base nginx.conf
+		// 下发主 nginx.conf
 		mainConf := filepath.Join(confDir, "nginx.conf")
 		if content, err := os.ReadFile(mainConf); err == nil {
 			os.WriteFile(mainConf+".bak."+time.Now().Format("20060102150405"), content, 0644)
@@ -2621,7 +2610,7 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 	}
 
 	if req.DomainConfig != "" {
-		// Deploy domain-specific server block to servers/{domain}.conf
+		// 下发域名 server 配置到 servers/{domain}.conf
 		domainConfPath := filepath.Join(confDir, "servers", domain+".conf")
 		if err := os.WriteFile(domainConfPath, []byte(req.DomainConfig), 0644); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to write domain config: %v", err))
@@ -2629,11 +2618,11 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 		}
 		log.Printf("[Manage] Domain config deployed at %s", domainConfPath)
 	} else {
-		// Fallback: legacy behavior
+		// 兜底：沿用旧逻辑
 		deployNginxSSLConfig(domain)
 	}
 
-	// Reload nginx to apply
+	// 重载 nginx 使配置生效
 	if err := reloadNginx(); err != nil {
 		log.Printf("[Manage] Nginx reload after setup-ssl failed: %v", err)
 	}
@@ -2645,7 +2634,7 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 }
 
 func reloadNginx() error {
-	for _, bin := range []string{"/usr/local/nginx/sbin/nginx", "nginx"} {
+	for _, bin := range constants.NginxBinarySearchPaths {
 		if path, err := exec.LookPath(bin); err == nil {
 			return runCommand(path, "-s", "reload")
 		}
@@ -2660,11 +2649,11 @@ func runCommand(name string, args ...string) error {
 	return nil
 }
 
-// deployDefaultXrayConfig deploys the embedded default xray config if no config exists.
+// 在缺失配置时下发内置默认配置。
 func (h *ManageHandler) deployDefaultXrayConfig() {
-	configPath := "/usr/local/etc/xray/config.json"
+	configPath := constants.DefaultXrayConfigPaths[0]
 	if _, err := os.Stat(configPath); err == nil {
-		// Config already exists — run EnsureXrayConfig to add missing sections
+		// 配置已存在，执行 EnsureXrayConfig 补齐缺失段
 		result := h.EnsureXrayConfig()
 		if result.Modified {
 			log.Printf("[Manage] Xray config updated after install: added %v", result.AddedSections)
@@ -2685,7 +2674,7 @@ func (h *ManageHandler) deployDefaultXrayConfig() {
 	exec.Command("systemctl", "restart", "xray").Run()
 }
 
-// ================== SSE Streaming Install/Remove ==================
+// ================== SSE 流式安装/卸载 ==================
 
 func sseStreamCmd(w http.ResponseWriter, r *http.Request, cmd *exec.Cmd, completeMsg string) {
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -2775,7 +2764,7 @@ func (h *ManageHandler) HandleXrayInstallStream(w http.ResponseWriter, r *http.R
 	cmd.Env = os.Environ()
 	sseStreamCmd(w, r, cmd, "Xray installed successfully")
 
-	// Deploy default config after install
+	// 安装完成后下发默认配置
 	h.deployDefaultXrayConfig()
 }
 

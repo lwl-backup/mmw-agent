@@ -195,4 +195,3 @@ func AddVMessOutbound(ctx context.Context, client command.HandlerServiceClient, 
 	_, err := client.AddOutbound(ctx, &command.AddOutboundRequest{Outbound: cfg})
 	return err
 }
-

@@ -8,28 +8,29 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
+
+	"mmw-agent/internal/constants"
 )
 
-// XrayMetrics represents the metrics response from Xray's /debug/vars endpoint
+// XrayMetrics 表示 Xray /debug/vars 的响应结构。
 type XrayMetrics struct {
 	Stats *XrayStats `json:"stats,omitempty"`
 }
 
-// XrayStats contains inbound, outbound, and user traffic stats
+// XrayStats 包含入站、出站和用户维度的流量统计。
 type XrayStats struct {
 	Inbound  map[string]TrafficData `json:"inbound,omitempty"`
 	Outbound map[string]TrafficData `json:"outbound,omitempty"`
 	User     map[string]TrafficData `json:"user,omitempty"`
 }
 
-// TrafficData contains uplink and downlink traffic in bytes
+// TrafficData 表示上下行流量（字节）。
 type TrafficData struct {
 	Uplink   int64 `json:"uplink"`
 	Downlink int64 `json:"downlink"`
 }
 
-// XrayConfig represents the structure of xray config.json for reading metrics port
+// XrayConfig 用于读取 xray config.json 中的 metrics 监听配置。
 type XrayConfig struct {
 	Log       json.RawMessage `json:"log,omitempty"`
 	DNS       json.RawMessage `json:"dns,omitempty"`
@@ -42,51 +43,51 @@ type XrayConfig struct {
 	Metrics   *MetricsConfig  `json:"metrics,omitempty"`
 }
 
-// MetricsConfig represents the metrics section in xray config
+// MetricsConfig 对应 xray 配置中的 metrics 段。
 type MetricsConfig struct {
 	Tag    string `json:"tag,omitempty"`
-	Listen string `json:"listen,omitempty"` // Format: "127.0.0.1:38889"
+	Listen string `json:"listen,omitempty"` // 格式示例: "127.0.0.1:38889"
 }
 
-// Collector collects traffic metrics from Xray servers
+// Collector 负责采集 Xray 流量指标。
 type Collector struct {
 	httpClient         *http.Client
 	defaultMetricsPort int
 	defaultMetricsHost string
 }
 
-// NewCollector creates a new metrics collector
+// 创建指标采集器。
 func NewCollector() *Collector {
 	return &Collector{
-		httpClient:         &http.Client{Timeout: 10 * time.Second},
-		defaultMetricsPort: 38889,
-		defaultMetricsHost: "127.0.0.1",
+		httpClient:         &http.Client{Timeout: constants.DefaultHTTPClientTimeout},
+		defaultMetricsPort: constants.DefaultMetricsPort,
+		defaultMetricsHost: constants.DefaultMetricsHost,
 	}
 }
 
-// GetMetricsPortFromConfig reads the metrics port from xray config file
+// 从 xray 配置中读取 metrics 监听地址和端口。
 func (c *Collector) GetMetricsPortFromConfig(configPath string) (string, int, error) {
 	if configPath == "" {
-		return "127.0.0.1", c.defaultMetricsPort, nil
+		return constants.DefaultMetricsHost, c.defaultMetricsPort, nil
 	}
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return "127.0.0.1", c.defaultMetricsPort, fmt.Errorf("read config file: %w", err)
+		return constants.DefaultMetricsHost, c.defaultMetricsPort, fmt.Errorf("read config file: %w", err)
 	}
 
 	var config XrayConfig
 	if err := json.Unmarshal(data, &config); err != nil {
-		return "127.0.0.1", c.defaultMetricsPort, fmt.Errorf("parse config file: %w", err)
+		return constants.DefaultMetricsHost, c.defaultMetricsPort, fmt.Errorf("parse config file: %w", err)
 	}
 
 	if config.Metrics == nil || config.Metrics.Listen == "" {
 		return "", 0, fmt.Errorf("metrics not configured in xray config")
 	}
 
-	// Parse listen address (format: "127.0.0.1:38889" or ":38889")
+	// 解析监听地址，支持 "127.0.0.1:38889" 或 ":38889"
 	listen := config.Metrics.Listen
-	host := "127.0.0.1"
+	host := constants.DefaultMetricsHost
 	var port int
 
 	if strings.Contains(listen, ":") {
@@ -102,7 +103,7 @@ func (c *Collector) GetMetricsPortFromConfig(configPath string) (string, int, er
 			port = p
 		}
 	} else {
-		// Try to parse as port only
+		// 兼容仅填写端口的写法
 		p, err := strconv.Atoi(listen)
 		if err != nil {
 			return "", 0, fmt.Errorf("invalid metrics listen format: %s", listen)
@@ -117,7 +118,7 @@ func (c *Collector) GetMetricsPortFromConfig(configPath string) (string, int, er
 	return host, port, nil
 }
 
-// FetchMetrics fetches metrics from Xray's /debug/vars endpoint
+// 从 Xray 的 /debug/vars 拉取指标。
 func (c *Collector) FetchMetrics(host string, port int) (*XrayMetrics, error) {
 	url := fmt.Sprintf("http://%s:%d/debug/vars", host, port)
 
@@ -149,7 +150,7 @@ func (c *Collector) FetchMetrics(host string, port int) (*XrayMetrics, error) {
 	return &metrics, nil
 }
 
-// MergeStats merges source stats into dest stats
+// 将 source 的统计合并到 dest。
 func MergeStats(dest, source *XrayStats) {
 	if source == nil {
 		return
