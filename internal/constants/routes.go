@@ -25,7 +25,8 @@ const (
 	PathChildScan         = "/api/child/scan"
 	PathChildCertDeploy   = "/api/child/cert/deploy"
 	PathChildNginxSetup   = "/api/child/nginx/setup-ssl"
-	PathChildDomainProbe  = "/api/child/domains/latency"
+	PathChildDomainProbe       = "/api/child/domains/latency"
+	PathChildNginxClearStream  = "/api/child/nginx/clear-stream-port"
 )
 
 const (

@@ -2640,6 +2640,75 @@ func runCommand(name string, args ...string) error {
 	return nil
 }
 
+func (h *ManageHandler) HandleClearStreamPort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var req struct {
+		Port int `json:"port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Port <= 0 {
+		writeError(w, http.StatusBadRequest, "valid port required")
+		return
+	}
+
+	streamDir := filepath.Join(constants.NginxPrimaryPrefixDir, "stream_servers")
+	if _, err := os.Stat(streamDir); err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"removed": 0,
+			"message": "stream_servers directory not found, nothing to clean",
+		})
+		return
+	}
+
+	entries, err := os.ReadDir(streamDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to read stream_servers: %v", err))
+		return
+	}
+
+	listenPattern := fmt.Sprintf("listen %d", req.Port)
+	var removed []string
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		filePath := filepath.Join(streamDir, entry.Name())
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(content), listenPattern) {
+			if err := os.Remove(filePath); err == nil {
+				removed = append(removed, entry.Name())
+				log.Printf("[Manage] Removed stream config %s (listening on port %d)", entry.Name(), req.Port)
+			}
+		}
+	}
+
+	if len(removed) > 0 {
+		if err := reloadNginx(); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("removed %d files but nginx reload failed: %v", len(removed), err))
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"removed": len(removed),
+		"files":   removed,
+		"message": fmt.Sprintf("removed %d stream config(s) listening on port %d", len(removed), req.Port),
+	})
+}
+
 // 在缺失配置时下发内置默认配置。
 func (h *ManageHandler) deployDefaultXrayConfig() {
 	configPath := constants.DefaultXrayConfigPaths[0]
