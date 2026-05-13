@@ -19,6 +19,7 @@ type Config struct {
 	Token                 string        `yaml:"token"`
 	ConnectionMode        string        `yaml:"connection_mode"`
 	ListenPort            string        `yaml:"listen_port"`
+	XrayMode              string        `yaml:"xray_mode"` // "external" (default) or "embedded"
 	XrayServers           []XrayServer  `yaml:"xray_servers"`
 	TrafficReportInterval time.Duration `yaml:"traffic_report_interval"`
 	SpeedReportInterval   time.Duration `yaml:"speed_report_interval"`
@@ -59,6 +60,7 @@ func FromEnv() *Config {
 		Token:          os.Getenv("MMWX_TOKEN"),
 		ConnectionMode: os.Getenv("MMWX_CONNECTION_MODE"),
 		ListenPort:     os.Getenv("MMWX_LISTEN_PORT"),
+		XrayMode:       os.Getenv("MMWX_XRAY_MODE"),
 		RestartMethod:  os.Getenv("MMWX_RESTART_METHOD"),
 		RestartCommand: os.Getenv("MMWX_RESTART_COMMAND"),
 	}
@@ -100,6 +102,9 @@ func (c *Config) Merge(env *Config) {
 	if env.ListenPort != "" {
 		c.ListenPort = env.ListenPort
 	}
+	if env.XrayMode != "" {
+		c.XrayMode = env.XrayMode
+	}
 	if len(env.XrayServers) > 0 {
 		c.XrayServers = env.XrayServers
 	}
@@ -133,6 +138,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RestartMethod == "" {
 		c.RestartMethod = "auto"
+	}
+	if c.XrayMode == "" {
+		c.XrayMode = "external"
 	}
 
 	if len(c.XrayServers) == 0 {

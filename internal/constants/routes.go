@@ -28,6 +28,7 @@ const (
 	PathChildDomainProbe       = "/api/child/domains/latency"
 	PathChildNginxClearStream  = "/api/child/nginx/clear-stream-port"
 	PathChildValidateSite      = "/api/child/validate-site"
+	PathChildLimiter           = "/api/child/limiter"
 )
 
 const (

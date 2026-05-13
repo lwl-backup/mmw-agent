@@ -23,6 +23,8 @@ import (
 	"mmw-agent/internal/config"
 	"mmw-agent/internal/constants"
 	"mmw-agent/internal/discovery"
+	"mmw-agent/internal/embedded"
+	"mmw-agent/internal/limiter"
 	"mmw-agent/internal/xrayconf"
 	"mmw-agent/internal/xrayctl"
 
@@ -64,6 +66,9 @@ type Client struct {
 	lastTxBytes    int64
 	lastSampleTime time.Time
 	speedMu        sync.Mutex
+
+	// 嵌入模式
+	embeddedXray *embedded.EmbeddedXray
 }
 
 // 创建 agent 客户端。
@@ -421,9 +426,19 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 		stats = &collector.XrayStats{}
 	}
 
-	payload, _ := json.Marshal(map[string]interface{}{
+	payloadMap := map[string]interface{}{
 		"stats": stats,
-	})
+	}
+
+	// 嵌入模式下附带在线设备信息
+	if c.embeddedXray != nil {
+		onlineUsers := c.collectOnlineUsers()
+		if len(onlineUsers) > 0 {
+			payloadMap["online_users"] = onlineUsers
+		}
+	}
+
+	payload, _ := json.Marshal(payloadMap)
 
 	msg := map[string]interface{}{
 		"type":    "traffic",
@@ -465,8 +480,32 @@ func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
 	return err
 }
 
+// SetEmbeddedXray 设置嵌入模式的 Xray 实例。
+func (c *Client) SetEmbeddedXray(ex *embedded.EmbeddedXray) {
+	c.embeddedXray = ex
+}
+
+// GetEmbeddedXray 返回嵌入模式的 Xray 实例。
+func (c *Client) GetEmbeddedXray() *embedded.EmbeddedXray {
+	return c.embeddedXray
+}
+
 // 采集本机 Xray 流量指标。
 func (c *Client) collectLocalMetrics() (*collector.XrayStats, error) {
+	// 嵌入模式：直接从 stats.Manager 读取
+	if c.embeddedXray != nil {
+		stats := c.embeddedXray.CollectStats()
+		if stats != nil {
+			return stats, nil
+		}
+		return &collector.XrayStats{
+			Inbound:  make(map[string]collector.TrafficData),
+			Outbound: make(map[string]collector.TrafficData),
+			User:     make(map[string]collector.TrafficData),
+		}, nil
+	}
+
+	// 外部模式：通过 HTTP /debug/vars 拉取
 	stats := &collector.XrayStats{
 		Inbound:  make(map[string]collector.TrafficData),
 		Outbound: make(map[string]collector.TrafficData),
@@ -991,6 +1030,7 @@ const (
 	WSMsgTypeDomainLatencyProbe  = "domain_latency_probe"
 	WSMsgTypeDomainLatencyResult = "domain_latency_result"
 	WSMsgTypeHeartbeatAck        = "heartbeat_ack"
+	WSMsgTypeLimiterConfig       = "limiter_config"
 )
 
 // WSCertDeployPayload 是主控端下发的证书部署指令。
@@ -1014,6 +1054,21 @@ type WSDomainLatencyProbePayload struct {
 	RequestID string   `json:"request_id"`
 	Domains   []string `json:"domains"`
 	TimeoutMs int      `json:"timeout_ms"`
+}
+
+// WSLimiterConfigPayload 是主控端下发的限速配置。
+type WSLimiterConfigPayload struct {
+	InboundTag string               `json:"inbound_tag"`
+	NodeLimit  uint64               `json:"node_limit"`
+	Users      []WSUserLimitInfo    `json:"users"`
+}
+
+// WSUserLimitInfo 是单个用户的限速和设备数配置。
+type WSUserLimitInfo struct {
+	UID         int    `json:"uid"`
+	Email       string `json:"email"`
+	SpeedLimit  uint64 `json:"speed_limit"`
+	DeviceLimit int    `json:"device_limit"`
 }
 
 // 处理主控端下发的消息。
@@ -1059,6 +1114,13 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 				log.Printf("[Agent] Clock drift detected: local time is %+ds from master", drift)
 			}
 		}
+	case WSMsgTypeLimiterConfig:
+		var payload WSLimiterConfigPayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Printf("[Agent] Failed to parse limiter_config payload: %v", err)
+			return
+		}
+		c.handleLimiterConfig(payload)
 	default:
 		// 忽略未知消息类型
 	}
@@ -1130,6 +1192,49 @@ func (c *Client) handleTokenUpdate(payload WSTokenUpdatePayload) {
 	c.config.Token = payload.ServerToken
 
 	log.Printf("[Agent] Token updated successfully in memory")
+}
+
+// 处理主控端下发的限速配置。
+func (c *Client) handleLimiterConfig(payload WSLimiterConfigPayload) {
+	if c.embeddedXray == nil {
+		log.Printf("[Agent] Ignoring limiter_config: not in embedded mode")
+		return
+	}
+
+	users := make([]limiter.UserInfo, len(payload.Users))
+	for i, u := range payload.Users {
+		users[i] = limiter.UserInfo{
+			UID:         u.UID,
+			Email:       u.Email,
+			SpeedLimit:  u.SpeedLimit,
+			DeviceLimit: u.DeviceLimit,
+		}
+	}
+
+	l := c.embeddedXray.GetLimiter()
+	if l == nil {
+		return
+	}
+
+	l.AddInboundLimiter(payload.InboundTag, payload.NodeLimit, users)
+	log.Printf("[Agent] Updated limiter for inbound %s: %d users, node_limit=%d",
+		payload.InboundTag, len(users), payload.NodeLimit)
+}
+
+// 采集所有 inbound 的在线设备信息。
+func (c *Client) collectOnlineUsers() map[string][]string {
+	if c.embeddedXray == nil {
+		return nil
+	}
+	result := make(map[string][]string)
+	tags := c.embeddedXray.ListInbounds()
+	for _, tag := range tags {
+		users := c.embeddedXray.GetOnlineUsers(tag)
+		for email, ips := range users {
+			result[email] = ips
+		}
+	}
+	return result
 }
 
 // 在本机探测域名延迟并回传结果。

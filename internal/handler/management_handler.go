@@ -19,6 +19,8 @@ import (
 
 	"mmw-agent/internal/constants"
 	"mmw-agent/internal/discovery"
+	"mmw-agent/internal/embedded"
+	"mmw-agent/internal/limiter"
 	"mmw-agent/internal/xrayctl"
 	"mmw-agent/internal/xrpc"
 
@@ -33,6 +35,7 @@ type ManageHandler struct {
 	configToken    string
 	restartMethod  string
 	restartCommand string
+	embeddedXray   *embedded.EmbeddedXray
 }
 
 // 创建管理处理器。
@@ -44,8 +47,16 @@ func NewManageHandler(configToken, restartMethod, restartCommand string) *Manage
 	}
 }
 
+// SetEmbeddedXray 设置嵌入模式的 Xray 实例。
+func (h *ManageHandler) SetEmbeddedXray(ex *embedded.EmbeddedXray) {
+	h.embeddedXray = ex
+}
+
 // RestartXray 使用配置的重启方式重启 xray。
 func (h *ManageHandler) RestartXray() error {
+	if h.embeddedXray != nil {
+		return h.embeddedXray.Restart()
+	}
 	return xrayctl.RestartXray(h.restartMethod, h.restartCommand)
 }
 
@@ -3035,4 +3046,54 @@ echo "Agent will be uninstalled in a few seconds."
 	cmd := exec.CommandContext(r.Context(), "bash", "-c", script)
 	cmd.Env = os.Environ()
 	sseStreamCmd(w, r, cmd, "Agent uninstall scheduled")
+}
+
+// HandleLimiter 处理 POST /api/child/limiter，用于直接配置嵌入式 Xray 的限速。
+func (h *ManageHandler) HandleLimiter(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	if h.embeddedXray == nil {
+		writeError(w, http.StatusBadRequest, "Not in embedded mode")
+		return
+	}
+
+	var req struct {
+		InboundTag string `json:"inbound_tag"`
+		NodeLimit  uint64 `json:"node_limit"`
+		Users      []struct {
+			UID         int    `json:"uid"`
+			Email       string `json:"email"`
+			SpeedLimit  uint64 `json:"speed_limit"`
+			DeviceLimit int    `json:"device_limit"`
+		} `json:"users"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	users := make([]limiter.UserInfo, len(req.Users))
+	for i, u := range req.Users {
+		users[i] = limiter.UserInfo{
+			UID:         u.UID,
+			Email:       u.Email,
+			SpeedLimit:  u.SpeedLimit,
+			DeviceLimit: u.DeviceLimit,
+		}
+	}
+
+	l := h.embeddedXray.GetLimiter()
+	if l == nil {
+		writeError(w, http.StatusInternalServerError, "Limiter not available")
+		return
+	}
+
+	l.AddInboundLimiter(req.InboundTag, req.NodeLimit, users)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }

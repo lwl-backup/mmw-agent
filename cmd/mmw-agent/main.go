@@ -13,6 +13,7 @@ import (
 	"mmw-agent/internal/agent"
 	"mmw-agent/internal/config"
 	"mmw-agent/internal/constants"
+	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/handler"
 )
 
@@ -54,6 +55,7 @@ func main() {
 
 	log.Printf("[Main] Starting mmw-agent")
 	log.Printf("[Main] Connection mode: %s", cfg.ConnectionMode)
+	log.Printf("[Main] Xray mode: %s", cfg.XrayMode)
 	log.Printf("[Main] Listen port: %s", cfg.ListenPort)
 	log.Printf("[Main] Xray servers: %d configured", len(cfg.XrayServers))
 	log.Printf("[Main] Restart method: %s", cfg.RestartMethod)
@@ -61,24 +63,45 @@ func main() {
 	// 创建处理器
 	manageHandler := handler.NewManageHandler(cfg.Token, cfg.RestartMethod, cfg.RestartCommand)
 
-	// P4: 启动时自动检测并补全 xray 配置
-	log.Printf("[Main] Running startup xray auto-detection...")
-	result := manageHandler.EnsureXrayConfig()
-	if result.Modified {
-		log.Printf("[Main] Xray config auto-completed on startup, added: %v", result.AddedSections)
-		if err := manageHandler.RestartXray(); err != nil {
-			log.Printf("[Main] Failed to restart xray after config update: %v", err)
+	// 嵌入模式：启动内嵌 Xray 实例
+	var embeddedXray *embedded.EmbeddedXray
+	if cfg.XrayMode == "embedded" && len(cfg.XrayServers) > 0 {
+		configPath := cfg.XrayServers[0].ConfigPath
+		if configPath != "" {
+			log.Printf("[Main] Starting embedded Xray with config: %s", configPath)
+			embeddedXray = embedded.New(configPath)
+			if err := embeddedXray.Start(); err != nil {
+				log.Fatalf("[Main] Failed to start embedded Xray: %v", err)
+			}
+			manageHandler.SetEmbeddedXray(embeddedXray)
 		} else {
-			time.Sleep(1 * time.Second)
+			log.Printf("[Main] Embedded mode requires xray config path, falling back to external")
 		}
-	} else if result.Error != "" {
-		log.Printf("[Main] Startup xray config check: %s", result.Error)
-	} else {
-		log.Printf("[Main] Xray config OK, no changes needed")
+	}
+
+	// 外部模式：启动时自动检测并补全 xray 配置
+	if embeddedXray == nil {
+		log.Printf("[Main] Running startup xray auto-detection...")
+		result := manageHandler.EnsureXrayConfig()
+		if result.Modified {
+			log.Printf("[Main] Xray config auto-completed on startup, added: %v", result.AddedSections)
+			if err := manageHandler.RestartXray(); err != nil {
+				log.Printf("[Main] Failed to restart xray after config update: %v", err)
+			} else {
+				time.Sleep(1 * time.Second)
+			}
+		} else if result.Error != "" {
+			log.Printf("[Main] Startup xray config check: %s", result.Error)
+		} else {
+			log.Printf("[Main] Xray config OK, no changes needed")
+		}
 	}
 
 	// 创建 agent 客户端
 	agentClient := agent.NewClient(cfg)
+	if embeddedXray != nil {
+		agentClient.SetEmbeddedXray(embeddedXray)
+	}
 
 	// 创建 API 处理器
 	apiHandler := handler.NewAPIHandler(agentClient, cfg.Token)
@@ -126,6 +149,11 @@ func main() {
 	// 优雅退出
 	cancel()
 	agentClient.Stop()
+	if embeddedXray != nil {
+		if err := embeddedXray.Stop(); err != nil {
+			log.Printf("[Main] Embedded Xray stop error: %v", err)
+		}
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), constants.DefaultShutdownTimeout)
 	defer shutdownCancel()
