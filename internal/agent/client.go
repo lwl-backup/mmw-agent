@@ -69,6 +69,10 @@ type Client struct {
 
 	// 嵌入模式
 	embeddedXray *embedded.EmbeddedXray
+
+	// 许可证状态
+	licenseStatus *LicenseStatus
+	licenseMu     sync.RWMutex
 }
 
 // 创建 agent 客户端。
@@ -1031,6 +1035,7 @@ const (
 	WSMsgTypeDomainLatencyResult = "domain_latency_result"
 	WSMsgTypeHeartbeatAck        = "heartbeat_ack"
 	WSMsgTypeLimiterConfig       = "limiter_config"
+	WSMsgTypeLicenseStatus       = "license_status"
 )
 
 // WSCertDeployPayload 是主控端下发的证书部署指令。
@@ -1069,6 +1074,36 @@ type WSUserLimitInfo struct {
 	Email       string `json:"email"`
 	SpeedLimit  uint64 `json:"speed_limit"`
 	DeviceLimit int    `json:"device_limit"`
+}
+
+// LicenseStatus 表示主控端下发的许可证状态。
+type LicenseStatus struct {
+	Valid      bool              `json:"valid"`
+	MaxServers int               `json:"max_servers"`
+	ExpiresAt  string            `json:"expires_at,omitempty"`
+	Plan       *LicensePlanInfo  `json:"plan,omitempty"`
+}
+
+// LicensePlanInfo 表示套餐信息。
+type LicensePlanInfo struct {
+	Name        string   `json:"name"`
+	DisplayName string   `json:"display_name"`
+	MaxServers  int      `json:"max_servers"`
+	MaxNodes    int      `json:"max_nodes"`
+	MaxUsers    int      `json:"max_users"`
+	Features    []string `json:"features"`
+}
+
+func (s *LicenseStatus) HasFeature(name string) bool {
+	if s == nil || s.Plan == nil {
+		return false
+	}
+	for _, f := range s.Plan.Features {
+		if f == name {
+			return true
+		}
+	}
+	return false
 }
 
 // 处理主控端下发的消息。
@@ -1121,6 +1156,13 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 			return
 		}
 		c.handleLimiterConfig(payload)
+	case WSMsgTypeLicenseStatus:
+		var payload LicenseStatus
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Printf("[Agent] Failed to parse license_status payload: %v", err)
+			return
+		}
+		c.handleLicenseStatus(payload)
 	default:
 		// 忽略未知消息类型
 	}
@@ -1195,9 +1237,31 @@ func (c *Client) handleTokenUpdate(payload WSTokenUpdatePayload) {
 }
 
 // 处理主控端下发的限速配置。
+func (c *Client) handleLicenseStatus(payload LicenseStatus) {
+	c.licenseMu.Lock()
+	c.licenseStatus = &payload
+	c.licenseMu.Unlock()
+
+	planName := "FREE"
+	if payload.Plan != nil {
+		planName = payload.Plan.DisplayName
+	}
+	log.Printf("[Agent] License status updated: valid=%v plan=%s max_servers=%d", payload.Valid, planName, payload.MaxServers)
+}
+
+func (c *Client) HasProFeature(name string) bool {
+	c.licenseMu.RLock()
+	defer c.licenseMu.RUnlock()
+	return c.licenseStatus.HasFeature(name)
+}
+
 func (c *Client) handleLimiterConfig(payload WSLimiterConfigPayload) {
 	if c.embeddedXray == nil {
 		log.Printf("[Agent] Ignoring limiter_config: not in embedded mode")
+		return
+	}
+	if !c.HasProFeature("limiter") {
+		log.Printf("[Agent] Ignoring limiter_config: limiter feature not licensed")
 		return
 	}
 
