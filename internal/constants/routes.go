@@ -29,6 +29,7 @@ const (
 	PathChildNginxClearStream  = "/api/child/nginx/clear-stream-port"
 	PathChildValidateSite      = "/api/child/validate-site"
 	PathChildLimiter           = "/api/child/limiter"
+	PathChildSwitchXrayMode    = "/api/child/agent/switch-xray-mode"
 )
 
 const (

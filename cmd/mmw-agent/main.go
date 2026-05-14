@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -43,8 +44,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to load config: %v", err)
 		}
-		// 合并环境变量（环境变量优先）
-		cfg.Merge(config.FromEnv())
+		// 合并环境变量（环境变量优先，只覆盖实际设置的字段）
+		cfg.MergeEnv()
 	} else {
 		cfg = config.FromEnv()
 	}
@@ -62,12 +63,18 @@ func main() {
 
 	// 创建处理器
 	manageHandler := handler.NewManageHandler(cfg.Token, cfg.RestartMethod, cfg.RestartCommand)
+	manageHandler.SetConfigPath(cfgFile)
 
 	// 嵌入模式：启动内嵌 Xray 实例
 	var embeddedXray *embedded.EmbeddedXray
 	if cfg.XrayMode == "embedded" && len(cfg.XrayServers) > 0 {
 		configPath := cfg.XrayServers[0].ConfigPath
 		if configPath != "" {
+			// 停止外部 Xray 避免端口冲突
+			log.Printf("[Main] Stopping external xray service before embedded start...")
+			_ = exec.Command("systemctl", "stop", "xray").Run()
+			_ = exec.Command("systemctl", "disable", "xray").Run()
+
 			log.Printf("[Main] Starting embedded Xray with config: %s", configPath)
 			embeddedXray = embedded.New(configPath)
 			if err := embeddedXray.Start(); err != nil {

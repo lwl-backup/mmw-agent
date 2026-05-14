@@ -33,6 +33,7 @@ var nginxInstalling atomic.Bool
 // ManageHandler 处理子端管理接口请求。
 type ManageHandler struct {
 	configToken    string
+	configPath     string
 	restartMethod  string
 	restartCommand string
 	embeddedXray   *embedded.EmbeddedXray
@@ -45,6 +46,11 @@ func NewManageHandler(configToken, restartMethod, restartCommand string) *Manage
 		restartMethod:  restartMethod,
 		restartCommand: restartCommand,
 	}
+}
+
+// SetConfigPath 设置 agent 配置文件路径，用于运行时修改配置。
+func (h *ManageHandler) SetConfigPath(path string) {
+	h.configPath = path
 }
 
 // SetEmbeddedXray 设置嵌入模式的 Xray 实例。
@@ -3096,4 +3102,110 @@ func (h *ManageHandler) HandleLimiter(w http.ResponseWriter, r *http.Request) {
 
 	l.AddInboundLimiter(req.InboundTag, req.NodeLimit, users)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
+// HandleSwitchXrayMode 处理 POST /api/child/agent/switch-xray-mode。
+// 切换 xray_mode（embedded↔external），更新 config.yaml 并自重启 agent。
+func (h *ManageHandler) HandleSwitchXrayMode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var req struct {
+		XrayMode string `json:"xray_mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if req.XrayMode != "external" && req.XrayMode != "embedded" {
+		writeError(w, http.StatusBadRequest, "xray_mode must be 'external' or 'embedded'")
+		return
+	}
+
+	if h.configPath == "" {
+		writeError(w, http.StatusInternalServerError, "Config path not set")
+		return
+	}
+
+	// 读取当前 config.yaml
+	data, err := os.ReadFile(h.configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Read config: %v", err))
+		return
+	}
+
+	// 更新 xray_mode 行
+	lines := strings.Split(string(data), "\n")
+	found := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "xray_mode:") {
+			lines[i] = "xray_mode: " + req.XrayMode
+			found = true
+			break
+		}
+	}
+	if !found {
+		lines = append(lines, "xray_mode: "+req.XrayMode)
+	}
+
+	if err := os.WriteFile(h.configPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Write config: %v", err))
+		return
+	}
+	log.Printf("[Manage] Config updated: xray_mode=%s", req.XrayMode)
+
+	// 切到 external：确保外部 xray 已安装并启用
+	if req.XrayMode == "external" {
+		if err := h.ensureExternalXray(); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Ensure external xray: %v", err))
+			return
+		}
+	}
+
+	// 先回复成功，再延迟自重启
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Switching to %s mode, agent restarting...", req.XrayMode),
+	})
+
+	// 刷出响应后再重启
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		log.Printf("[Manage] Restarting agent for xray_mode switch to %s", req.XrayMode)
+		exec.Command("systemctl", "restart", "mmw-agent").Start()
+	}()
+}
+
+// ensureExternalXray 确保外部 Xray 已安装、启用并启动。
+func (h *ManageHandler) ensureExternalXray() error {
+	// 检查 xray 二进制是否存在
+	if _, err := exec.LookPath("xray"); err != nil {
+		log.Printf("[Manage] External xray not found, installing...")
+		cmd := exec.Command("bash", "-c",
+			`bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install`)
+		cmd.Env = os.Environ()
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("install xray: %v (%s)", err, string(output))
+		}
+		log.Printf("[Manage] External xray installed")
+	}
+
+	// 启用并启动外部 xray 服务
+	exec.Command("systemctl", "enable", "xray").Run()
+	if err := exec.Command("systemctl", "start", "xray").Run(); err != nil {
+		return fmt.Errorf("start xray service: %v", err)
+	}
+	log.Printf("[Manage] External xray service enabled and started")
+	return nil
 }

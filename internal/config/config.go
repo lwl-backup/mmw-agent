@@ -53,8 +53,8 @@ func Load(path string) (*Config, error) {
 	return &config, nil
 }
 
-// 从环境变量构造配置。
-func FromEnv() *Config {
+// 从环境变量构造配置（不含默认值，用于 Merge）。
+func fromEnvRaw() *Config {
 	config := &Config{
 		MasterURL:      os.Getenv("MMWX_MASTER_URL"),
 		Token:          os.Getenv("MMWX_TOKEN"),
@@ -84,8 +84,19 @@ func FromEnv() *Config {
 		}
 	}
 
+	return config
+}
+
+// 从环境变量构造完整配置（含默认值，独立使用时调用）。
+func FromEnv() *Config {
+	config := fromEnvRaw()
 	config.applyDefaults()
 	return config
+}
+
+// MergeEnv 将环境变量覆盖到已加载的文件配置上，只覆盖环境变量中实际设置的字段。
+func (c *Config) MergeEnv() {
+	c.Merge(fromEnvRaw())
 }
 
 // 合并环境变量配置到文件配置（环境变量优先）。

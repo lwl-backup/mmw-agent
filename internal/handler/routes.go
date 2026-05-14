@@ -35,6 +35,7 @@ func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandl
 	mux.HandleFunc(constants.PathChildNginxClearStream, manageHandler.HandleClearStreamPort)
 	mux.HandleFunc(constants.PathChildValidateSite, manageHandler.HandleValidateSite)
 	mux.HandleFunc(constants.PathChildLimiter, manageHandler.HandleLimiter)
+	mux.HandleFunc(constants.PathChildSwitchXrayMode, manageHandler.HandleSwitchXrayMode)
 
 	// SSE 流式安装和卸载接口
 	mux.HandleFunc(constants.PathChildXrayInstallStream, manageHandler.HandleXrayInstallStream)

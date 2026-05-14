@@ -5,7 +5,6 @@ import (
 	"log"
 	"sync"
 
-	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/proxyman/command"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/core"
@@ -258,5 +257,3 @@ type EmbeddedError struct {
 
 func (e *EmbeddedError) Error() string { return e.msg }
 
-// ensure proxyman is imported so inbound/outbound manager configs are registered
-var _ = proxyman.InboundConfig{}
