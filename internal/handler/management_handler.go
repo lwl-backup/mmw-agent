@@ -3270,7 +3270,7 @@ func (h *ManageHandler) HandleNginxInstallStream(w http.ResponseWriter, r *http.
 
 	log.Printf("[Manage] Starting Nginx install (stream)...")
 	cmd := exec.CommandContext(r.Context(), "bash", "-c",
-		`curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh | bash`)
+		`set -e; SCRIPT=$(mktemp); curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh -o "$SCRIPT"; bash "$SCRIPT"; rm -f "$SCRIPT"`)
 	cmd.Env = os.Environ()
 	sseStreamCmd(w, r, cmd, "Nginx installed successfully")
 
