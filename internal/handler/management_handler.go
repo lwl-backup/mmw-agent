@@ -136,6 +136,47 @@ func (h *ManageHandler) configNeedsPort443() bool {
 	return false
 }
 
+const fallback443Conf = `server {
+    listen 443;
+    listen [::]:443;
+    proxy_pass 127.0.0.1:8001;
+    proxy_protocol on;
+}
+`
+
+func (h *ManageHandler) fallback443Path() string {
+	return filepath.Join(constants.NginxPrimaryPrefixDir, "stream_servers", "xray_fallback_443.conf")
+}
+
+func (h *ManageHandler) deployFallback443() {
+	path := h.fallback443Path()
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	if err := os.WriteFile(path, []byte(fallback443Conf), 0644); err != nil {
+		log.Printf("[Manage] Failed to deploy fallback_443: %v", err)
+	} else {
+		log.Printf("[Manage] Deployed fallback_443 stream config")
+	}
+}
+
+func (h *ManageHandler) removeFallback443() {
+	path := h.fallback443Path()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("[Manage] Failed to remove fallback_443: %v", err)
+	} else {
+		log.Printf("[Manage] Removed fallback_443 stream config")
+	}
+}
+
+func (h *ManageHandler) reloadNginx() {
+	for _, bin := range constants.NginxBinarySearchPaths {
+		if p, err := exec.LookPath(bin); err == nil {
+			_ = exec.Command(p, "-s", "reload").Run()
+			return
+		}
+	}
+	_ = exec.Command("systemctl", "reload", "nginx").Run()
+}
+
 // lazyStartEmbeddedXray 在 embedded 模式下延迟初始化 xray 实例。
 func (h *ManageHandler) lazyStartEmbeddedXray() error {
 	for _, p := range constants.DefaultXrayConfigPaths {
@@ -406,6 +447,45 @@ func (h *ManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Requ
 	if req.Service == "xray" && req.Action == "restart" {
 		if err := h.RestartXray(); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to restart xray: %v", err))
+			return
+		}
+	} else if req.Service == "xray" && req.Action == "stop" {
+		// tunnel 模式：停止前恢复 nginx stream fallback，让 nginx 直接接管 443
+		if h.configNeedsPort443() {
+			h.deployFallback443()
+			h.reloadNginx()
+		}
+		log.Printf("[Manage] Service xray: stop (deferred)")
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Service xray stopped successfully",
+		})
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			if h.embeddedXray != nil {
+				h.embeddedXray.Stop()
+			} else {
+				exec.Command("systemctl", "stop", "xray").Run()
+			}
+		}()
+		return
+	} else if req.Service == "xray" && req.Action == "start" {
+		// tunnel 模式：启动前移除 nginx stream fallback，释放 443 端口
+		if h.configNeedsPort443() {
+			h.removeFallback443()
+			h.reloadNginx()
+			time.Sleep(300 * time.Millisecond)
+		}
+		if err := h.RestartXray(); err != nil {
+			// 启动失败，恢复 fallback
+			if h.configNeedsPort443() {
+				h.deployFallback443()
+				h.reloadNginx()
+			}
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to start xray: %v", err))
 			return
 		}
 	} else {
