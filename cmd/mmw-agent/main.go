@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -85,6 +87,7 @@ func main() {
 		_ = exec.Command("systemctl", "stop", "xray").Run()
 		_ = exec.Command("systemctl", "disable", "xray").Run()
 
+		ensureGeoData()
 		initXrayConfig(configPath, cfg.StealMode)
 		// 补全配置（api、stats、policy、routing等）
 		if result := manageHandler.EnsureXrayConfig(); result.Modified {
@@ -205,6 +208,56 @@ func main() {
 	}
 
 	log.Printf("[Main] Shutdown complete")
+}
+
+func ensureGeoData() {
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Printf("[Main] Cannot determine executable path for geodata: %v", err)
+		return
+	}
+	dir := filepath.Dir(exePath)
+
+	files := map[string]string{
+		"geoip.dat":  "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+		"geosite.dat": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+	}
+
+	for name, url := range files {
+		dest := filepath.Join(dir, name)
+		if _, err := os.Stat(dest); err == nil {
+			continue
+		}
+		log.Printf("[Main] Downloading %s ...", name)
+		if err := downloadFile(dest, url); err != nil {
+			log.Printf("[Main] Failed to download %s: %v", name, err)
+		} else {
+			log.Printf("[Main] Downloaded %s to %s", name, dest)
+		}
+	}
+}
+
+func downloadFile(dest, url string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	tmp := dest + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	f.Close()
+	return os.Rename(tmp, dest)
 }
 
 func initXrayConfig(path string, stealMode string) {
