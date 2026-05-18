@@ -20,6 +20,7 @@ type Config struct {
 	ConnectionMode        string        `yaml:"connection_mode"`
 	ListenPort            string        `yaml:"listen_port"`
 	XrayMode              string        `yaml:"xray_mode"` // "external" (default) or "embedded"
+	StealMode             string        `yaml:"steal_mode"` // "", "tunnel", "fallback"
 	XrayServers           []XrayServer  `yaml:"xray_servers"`
 	TrafficReportInterval time.Duration `yaml:"traffic_report_interval"`
 	SpeedReportInterval   time.Duration `yaml:"speed_report_interval"`

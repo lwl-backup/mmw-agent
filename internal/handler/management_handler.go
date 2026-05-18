@@ -2600,6 +2600,34 @@ func (h *ManageHandler) EnsureXrayConfig() *EnsureXrayConfigResult {
 		modified = true
 	}
 
+	if !h.hasRequiredOutbounds(config) {
+		h.addRequiredOutbounds(config)
+		result.AddedSections = append(result.AddedSections, "outbounds")
+		modified = true
+	}
+
+	if _, ok := config["metrics"]; !ok {
+		config["metrics"] = map[string]interface{}{
+			"tag":    "Metrics",
+			"listen": "127.0.0.1:38889",
+		}
+		result.AddedSections = append(result.AddedSections, "metrics")
+		modified = true
+	}
+
+	if _, ok := config["log"]; !ok {
+		config["log"] = map[string]interface{}{
+			"loglevel": "error",
+		}
+		result.AddedSections = append(result.AddedSections, "log")
+		modified = true
+	}
+
+	if h.ensureRoutingRules(config) {
+		result.AddedSections = append(result.AddedSections, "routing_rules")
+		modified = true
+	}
+
 	if modified {
 		backupPath := configPath + ".backup"
 		if err := os.WriteFile(backupPath, content, 0644); err != nil {
@@ -2733,6 +2761,124 @@ func (h *ManageHandler) addAPIRoutingRule(config map[string]interface{}) {
 		rules = []interface{}{}
 	}
 	routing["rules"] = append([]interface{}{apiRule}, rules...)
+}
+
+func (h *ManageHandler) hasRequiredOutbounds(config map[string]interface{}) bool {
+	outbounds, ok := config["outbounds"].([]interface{})
+	if !ok {
+		return false
+	}
+	hasDirect, hasBlock := false, false
+	for _, ob := range outbounds {
+		if outbound, ok := ob.(map[string]interface{}); ok {
+			switch tag, _ := outbound["tag"].(string); tag {
+			case "direct":
+				hasDirect = true
+			case "block":
+				hasBlock = true
+			}
+		}
+	}
+	return hasDirect && hasBlock
+}
+
+func (h *ManageHandler) addRequiredOutbounds(config map[string]interface{}) {
+	outbounds, ok := config["outbounds"].([]interface{})
+	if !ok {
+		outbounds = []interface{}{}
+	}
+
+	tags := map[string]bool{}
+	for _, ob := range outbounds {
+		if outbound, ok := ob.(map[string]interface{}); ok {
+			if tag, _ := outbound["tag"].(string); tag != "" {
+				tags[tag] = true
+			}
+		}
+	}
+
+	if !tags["direct"] {
+		outbounds = append(outbounds, map[string]interface{}{
+			"tag":      "direct",
+			"protocol": "freedom",
+		})
+	}
+	if !tags["block"] {
+		outbounds = append(outbounds, map[string]interface{}{
+			"tag":      "block",
+			"protocol": "blackhole",
+		})
+	}
+	config["outbounds"] = outbounds
+}
+
+func (h *ManageHandler) ensureRoutingRules(config map[string]interface{}) bool {
+	routing, ok := config["routing"].(map[string]interface{})
+	if !ok {
+		routing = map[string]interface{}{
+			"domainStrategy": "IPIfNonMatch",
+			"rules":          []interface{}{},
+		}
+		config["routing"] = routing
+	}
+
+	rules, ok := routing["rules"].([]interface{})
+	if !ok {
+		rules = []interface{}{}
+	}
+
+	existingMarktags := map[string]bool{}
+	for _, r := range rules {
+		if rule, ok := r.(map[string]interface{}); ok {
+			if mt, _ := rule["marktag"].(string); mt != "" {
+				existingMarktags[mt] = true
+			}
+		}
+	}
+
+	added := false
+	requiredRules := []map[string]interface{}{
+		{"type": "field", "protocol": []interface{}{"bittorrent"}, "marktag": "ban_bt", "outboundTag": "block"},
+		{"type": "field", "ip": []interface{}{"geoip:cn"}, "marktag": "ban_geoip_cn", "outboundTag": "block"},
+		{"type": "field", "domain": []interface{}{"geosite:openai"}, "marktag": "fix_openai", "outboundTag": "direct"},
+		{"type": "field", "ip": []interface{}{"geoip:private"}, "outboundTag": "block"},
+	}
+
+	for _, req := range requiredRules {
+		marktag, _ := req["marktag"].(string)
+		if marktag != "" && existingMarktags[marktag] {
+			continue
+		}
+		// geoip:private 没有 marktag，按 ip 内容判断
+		if marktag == "" {
+			found := false
+			for _, r := range rules {
+				if rule, ok := r.(map[string]interface{}); ok {
+					if ips, ok := rule["ip"].([]interface{}); ok {
+						for _, ip := range ips {
+							if ip == "geoip:private" {
+								found = true
+								break
+							}
+						}
+					}
+				}
+				if found {
+					break
+				}
+			}
+			if found {
+				continue
+			}
+		}
+		rules = append(rules, req)
+		added = true
+	}
+
+	if added {
+		routing["rules"] = rules
+	}
+	return added
 }
 
 // ================== 证书部署 ==================

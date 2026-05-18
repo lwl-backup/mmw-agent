@@ -1367,6 +1367,7 @@ const (
 	WSMsgTypeHeartbeatAck        = "heartbeat_ack"
 	WSMsgTypeLimiterConfig       = "limiter_config"
 	WSMsgTypeLicenseStatus       = "license_status"
+	WSMsgTypeConfigUpdate        = "config_update"
 )
 
 // WSCertDeployPayload 是主控端下发的证书部署指令。
@@ -1495,6 +1496,13 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 			return
 		}
 		c.handleLicenseStatus(payload)
+	case WSMsgTypeConfigUpdate:
+		var payload map[string]string
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Printf("[Agent] Failed to parse config_update payload: %v", err)
+			return
+		}
+		c.handleConfigUpdate(payload)
 	default:
 		// 忽略未知消息类型
 	}
@@ -1822,15 +1830,19 @@ func extractSSLListenPort(conf string) int {
 
 // 扫描本机 xray 状态并上报主控端。
 func (c *Client) sendScanResult(conn *websocket.Conn) {
-	// 检查 xray 运行状态
 	xrayRunning := false
 	xrayVersion := ""
-	cmd := exec.Command("xray", "version")
-	if out, err := cmd.Output(); err == nil {
-		xrayVersion = strings.TrimSpace(strings.Split(string(out), "\n")[0])
-	}
-	if exec.Command("systemctl", "is-active", "--quiet", "xray").Run() == nil {
-		xrayRunning = true
+
+	if c.config.XrayMode == "embedded" && c.embeddedXray != nil {
+		xrayRunning = c.embeddedXray.IsRunning()
+	} else {
+		cmd := exec.Command("xray", "version")
+		if out, err := cmd.Output(); err == nil {
+			xrayVersion = strings.TrimSpace(strings.Split(string(out), "\n")[0])
+		}
+		if exec.Command("systemctl", "is-active", "--quiet", "xray").Run() == nil {
+			xrayRunning = true
+		}
 	}
 
 	// 从配置读取入站列表（使用 3-tier 发现）
@@ -1867,4 +1879,43 @@ func (c *Client) sendScanResult(conn *websocket.Conn) {
 		return
 	}
 	log.Printf("[Agent] Sent scan_result: xray_running=%v, inbounds=%d", xrayRunning, len(inbounds))
+}
+
+func (c *Client) handleConfigUpdate(updates map[string]string) {
+	if stealMode, ok := updates["steal_mode"]; ok && stealMode != c.config.StealMode {
+		c.config.StealMode = stealMode
+		if err := c.persistConfigField("steal_mode", stealMode); err != nil {
+			log.Printf("[Agent] Failed to persist steal_mode: %v", err)
+		} else {
+			log.Printf("[Agent] Updated steal_mode to %q", stealMode)
+		}
+	}
+}
+
+func (c *Client) persistConfigField(key, value string) error {
+	cfgPath := "/etc/mmw-agent/config.yaml"
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		return nil
+	}
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	found := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, key+":") {
+			lines[i] = key + ": " + value
+			found = true
+			break
+		}
+	}
+	if !found {
+		lines = append(lines, key+": "+value)
+	}
+
+	return os.WriteFile(cfgPath, []byte(strings.Join(lines, "\n")), 0644)
 }

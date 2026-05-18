@@ -85,12 +85,8 @@ func main() {
 		_ = exec.Command("systemctl", "stop", "xray").Run()
 		_ = exec.Command("systemctl", "disable", "xray").Run()
 
-		if needsDefaultConfig(configPath) {
-			log.Printf("[Main] Embedded mode: config missing or empty, creating default template config")
-			_ = os.MkdirAll(filepath.Dir(configPath), 0755)
-			_ = os.WriteFile(configPath, []byte(embedded.DefaultConfigJSON), 0644)
-		}
-		// 补全配置（api、stats、policy、routing等），与外置模式一致
+		initXrayConfig(configPath, cfg.StealMode)
+		// 补全配置（api、stats、policy、routing等）
 		if result := manageHandler.EnsureXrayConfig(); result.Modified {
 			log.Printf("[Main] Embedded mode: config auto-completed, added: %v", result.AddedSections)
 		}
@@ -211,14 +207,28 @@ func main() {
 	log.Printf("[Main] Shutdown complete")
 }
 
-func needsDefaultConfig(path string) bool {
-	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return true
+func initXrayConfig(path string, stealMode string) {
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+
+	switch stealMode {
+	case "tunnel", "fallback":
+		// 偷自己模式：备份原配置后用模板覆盖
+		if _, err := os.Stat(path); err == nil {
+			_ = os.Rename(path, path+".backup")
+			log.Printf("[Main] Backed up existing config to %s.backup", path)
+		}
+		tpl := embedded.TunnelConfigJSON
+		if stealMode == "fallback" {
+			tpl = embedded.DefaultConfigJSON
+		}
+		_ = os.WriteFile(path, []byte(tpl), 0644)
+		log.Printf("[Main] Steal-self mode (%s): wrote template config", stealMode)
+	default:
+		// 普通模式：配置不存在或为空时写入默认模板
+		info, err := os.Stat(path)
+		if os.IsNotExist(err) || (err == nil && info.Size() <= 4) {
+			_ = os.WriteFile(path, []byte(embedded.DefaultConfigJSON), 0644)
+			log.Printf("[Main] Config missing or empty, wrote default template config")
+		}
 	}
-	if err != nil {
-		return true
-	}
-	// 文件存在但内容为空或只有 "{}" (<=4 bytes 包含换行)
-	return info.Size() <= 4
 }
