@@ -25,7 +25,7 @@ const (
 )
 
 const (
-	DefaultTrafficReportInterval = 1 * time.Minute
+	DefaultTrafficReportInterval = 5 * time.Second
 	DefaultSpeedReportInterval   = 3 * time.Second
 	DefaultHTTPClientTimeout     = 10 * time.Second
 	DefaultReadTimeout           = 30 * time.Second

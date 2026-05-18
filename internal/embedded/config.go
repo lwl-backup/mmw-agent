@@ -45,6 +45,14 @@ func buildCoreConfig(configPath string) (*core.Config, error) {
 					},
 				},
 			},
+			System: &policy.SystemPolicy{
+				Stats: &policy.SystemPolicy_Stats{
+					InboundUplink:    true,
+					InboundDownlink:  true,
+					OutboundUplink:   true,
+					OutboundDownlink: true,
+				},
+			},
 		}),
 	}
 
