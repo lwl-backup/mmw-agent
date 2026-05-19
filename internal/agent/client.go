@@ -81,6 +81,11 @@ type Client struct {
 	// 嵌入模式
 	embeddedXray *embedded.EmbeddedXray
 
+	// 活跃的 traffic ticker 注册表,key 是 *time.Ticker。
+	// 4 处 runXxxLoop (WebSocket / HTTP / Pull / Pull+TrafficReport) 起 ticker 时 Store,defer Delete。
+	// handleConfigUpdate 拿到新 interval 时遍历 Reset → 实现热重载,无需重连 / 重启。
+	trafficTickers sync.Map
+
 	// 许可证状态
 	licenseStatus *LicenseStatus
 	licenseMu     sync.RWMutex
@@ -517,6 +522,7 @@ func (c *Client) decryptMessage(message []byte) []byte {
 // 处理流量、速率和心跳上报。
 func (c *Client) runMessageLoop(ctx context.Context, conn *websocket.Conn) error {
 	trafficTicker := time.NewTicker(c.config.TrafficReportInterval)
+	defer c.registerTrafficTicker(trafficTicker)() // master push config_update 时 Reset 该 ticker
 	speedTicker := time.NewTicker(c.config.SpeedReportInterval)
 	heartbeatTicker := time.NewTicker(constants.WebSocketHeartbeatInterval)
 	defer trafficTicker.Stop()
@@ -881,6 +887,7 @@ func (c *Client) runHTTPReporter(ctx context.Context) {
 // 执行 HTTP 上报循环。
 func (c *Client) runHTTPReporterLoop(ctx context.Context) {
 	trafficTicker := time.NewTicker(c.config.TrafficReportInterval)
+	defer c.registerTrafficTicker(trafficTicker)() // master push config_update 时 Reset 该 ticker
 	speedTicker := time.NewTicker(c.config.SpeedReportInterval)
 	heartbeatTicker := time.NewTicker(constants.WebSocketHeartbeatInterval)
 	defer trafficTicker.Stop()
@@ -950,8 +957,18 @@ func (c *Client) sendTrafficHTTP(ctx context.Context) error {
 	}
 	u.Path = constants.PathRemoteTraffic
 
-	if _, err := c.doEncryptedHTTP(ctx, u.String(), payload); err != nil {
+	resp, err := c.doEncryptedHTTP(ctx, u.String(), payload)
+	if err != nil {
 		return err
+	}
+
+	// HTTP-mode 没有持久连接,master 把 config_update 捎带在 traffic 响应里。
+	// 解析失败/无 config_updates 字段时静默跳过,不影响 traffic 上报流程。
+	var respWrap struct {
+		ConfigUpdates map[string]string `json:"config_updates"`
+	}
+	if jerr := json.Unmarshal(resp, &respWrap); jerr == nil && len(respWrap.ConfigUpdates) > 0 {
+		c.handleConfigUpdate(respWrap.ConfigUpdates)
 	}
 
 	log.Printf("[Agent] Sent traffic data via HTTP: %d inbounds, %d outbounds, %d users",
@@ -1136,6 +1153,7 @@ func (c *Client) doHTTPKeyExchange(ctx context.Context, urlStr string, payload [
 // 在拉取模式下持续上报流量，保持在线状态。
 func (c *Client) runPullModeWithTrafficReport(ctx context.Context, duration time.Duration) {
 	trafficTicker := time.NewTicker(c.config.TrafficReportInterval)
+	defer c.registerTrafficTicker(trafficTicker)() // master push config_update 时 Reset 该 ticker
 	defer trafficTicker.Stop()
 
 	timeout := time.After(duration)
@@ -1173,6 +1191,7 @@ func (c *Client) waitWithTrafficReport(ctx context.Context, duration time.Durati
 	}
 
 	trafficTicker := time.NewTicker(c.config.TrafficReportInterval)
+	defer c.registerTrafficTicker(trafficTicker)() // master push config_update 时 Reset 该 ticker
 	defer trafficTicker.Stop()
 
 	timeout := time.After(duration)
@@ -1896,6 +1915,38 @@ func (c *Client) handleConfigUpdate(updates map[string]string) {
 			log.Printf("[Agent] Updated steal_mode to %q", stealMode)
 		}
 	}
+	// traffic_report_interval_ms: master 修改后 push,无需重启 agent 立即应用到所有 4 处 ticker。
+	// clamp 到 [1s, 60s] 避免极端值导致 master 压力暴涨或数据滞后。
+	if raw, ok := updates["traffic_report_interval_ms"]; ok {
+		if ms, err := strconv.Atoi(raw); err == nil {
+			if ms < 1000 {
+				ms = 1000
+			}
+			if ms > 60000 {
+				ms = 60000
+			}
+			d := time.Duration(ms) * time.Millisecond
+			if d != c.config.TrafficReportInterval {
+				c.config.TrafficReportInterval = d
+				resetCount := 0
+				c.trafficTickers.Range(func(k, _ any) bool {
+					if t, ok := k.(*time.Ticker); ok {
+						t.Reset(d)
+						resetCount++
+					}
+					return true
+				})
+				log.Printf("[Agent] traffic_report_interval updated to %v (reset %d active tickers)", d, resetCount)
+			}
+		}
+	}
+}
+
+// registerTrafficTicker 把活跃 ticker 加入 registry,返回 deregister 闭包(配合 defer)。
+// 用于 master push config_update 时遍历 Reset。
+func (c *Client) registerTrafficTicker(t *time.Ticker) func() {
+	c.trafficTickers.Store(t, struct{}{})
+	return func() { c.trafficTickers.Delete(t) }
 }
 
 func (c *Client) persistConfigField(key, value string) error {
