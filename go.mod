@@ -2,6 +2,11 @@ module mmw-agent
 
 go 1.26
 
+// vision splice 后绕过 RateWriter 的限速问题需要 fork xray-core 加 conn 层 hook,
+// 见 fork 中 proxy/vision_limiter_hook.go + proxy/proxy.go 修改两行。
+// 后续 upstream rebase 流程:cp 新版本 → re-apply 这俩文件 → go build。
+replace github.com/xtls/xray-core => /home/ubuntu/opensource/xray-core-vision-limiter
+
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/xtls/xray-core v1.260327.0
