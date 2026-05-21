@@ -35,6 +35,12 @@ jobs:
           go-version: '1.26'
           cache: true
 
+      # go.mod 用相对路径 replace github.com/xtls/xray-core => ../xray-core-vision-limiter,
+      # 这里把 fork 克隆到该相对位置(与 checkout 出来的仓库同级)。fork 的 module 名仍是
+      # github.com/xtls/xray-core,所以只能相对路径 replace,不能用 git 版本 replace。
+      - name: Clone xray-core fork (vision limiter)
+        run: git clone --depth 1 https://github.com/iluobei/Xray-core-mmwx.git ../xray-core-vision-limiter
+
       - name: Go mod download
         run: go mod download
 
