@@ -5,6 +5,9 @@
 <details>
 <summary>更新日志</summary>
 
+### v0.0.10 (2026-05-22)
+- 🌈 支持路由负载均衡配置
+
 ### v0.0.9 (2026-05-21)
 - 🛠️ fix:vision limiter fork
 
