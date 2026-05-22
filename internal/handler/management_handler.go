@@ -2083,6 +2083,10 @@ type RoutingRequest struct {
 	Routing map[string]interface{} `json:"routing,omitempty"`
 	Rule    map[string]interface{} `json:"rule,omitempty"`
 	Index   int                    `json:"index,omitempty"`
+	// 负载均衡 leastPing/leastLoad 需要的 xray 顶层观测站配置(routing.balancers 已随 Routing 透传)。
+	// RawMessage 三态:缺失=保持不变;JSON null=清除该观测站;对象=写入。
+	Observatory      json.RawMessage `json:"observatory,omitempty"`
+	BurstObservatory json.RawMessage `json:"burstObservatory,omitempty"`
 }
 
 // 处理路由管理请求。
@@ -2129,6 +2133,21 @@ func (h *ManageHandler) getRouting(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// applyObservatory 按 RawMessage 三态把顶层 observatory/burstObservatory 写入/删除/保持。
+func applyObservatory(config map[string]interface{}, key string, raw json.RawMessage) {
+	if len(raw) == 0 {
+		return // 缺失:保持不变
+	}
+	if string(raw) == "null" {
+		delete(config, key) // 显式清除
+		return
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		config[key] = obj
+	}
+}
+
 func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 	var req RoutingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -2166,6 +2185,9 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		config["routing"] = req.Routing
+		// 负载均衡 leastPing/leastLoad 的顶层观测站:对象=写入,JSON null=删除,缺失=不动。
+		applyObservatory(config, "observatory", req.Observatory)
+		applyObservatory(config, "burstObservatory", req.BurstObservatory)
 
 	case "add_rule":
 		if req.Rule == nil {
