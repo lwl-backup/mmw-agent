@@ -885,14 +885,22 @@ func (c *Client) runHTTPReporter(ctx context.Context) {
 }
 
 // 执行 HTTP 上报循环。
+//
+// 触发 return 的两条路径:
+//  1. HTTP 连错 maxErrors 次 → 让 outer auto-loop 切到 pull 或 sleep
+//  2. wsProbeTicker 定期 dial ws 成功 → 返回让 outer auto-loop 切回 ws (升级)
+//     这是关键改动:HTTP 一直成功时,以前永远不试 ws;现在每 wsProbeInterval 探一次,
+//     ws 恢复立即升级,基于 ws 的功能(SSE 流/域名探测/即时命令)就能用了。
 func (c *Client) runHTTPReporterLoop(ctx context.Context) {
 	trafficTicker := time.NewTicker(c.config.TrafficReportInterval)
 	defer c.registerTrafficTicker(trafficTicker)() // master push config_update 时 Reset 该 ticker
 	speedTicker := time.NewTicker(c.config.SpeedReportInterval)
 	heartbeatTicker := time.NewTicker(constants.WebSocketHeartbeatInterval)
+	wsProbeTicker := time.NewTicker(60 * time.Second) // 每分钟探一次 ws 是否恢复
 	defer trafficTicker.Stop()
 	defer speedTicker.Stop()
 	defer heartbeatTicker.Stop()
+	defer wsProbeTicker.Stop()
 
 	c.sendHeartbeatHTTP(ctx)
 	c.sendTrafficHTTP(ctx)
@@ -931,6 +939,12 @@ func (c *Client) runHTTPReporterLoop(ctx context.Context) {
 				}
 			} else {
 				consecutiveErrors = 0
+			}
+		case <-wsProbeTicker.C:
+			// 探测 ws 是否可用(只对支持 ws 的主控 URL 探;tryWebSocketOnce 内部判断 scheme)
+			if err := c.tryWebSocketOnce(ctx); err == nil {
+				log.Printf("[Agent] WebSocket recovered, upgrading from HTTP mode")
+				return
 			}
 		}
 	}

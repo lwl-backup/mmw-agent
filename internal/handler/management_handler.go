@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -2087,6 +2088,9 @@ type RoutingRequest struct {
 	// RawMessage 三态:缺失=保持不变;JSON null=清除该观测站;对象=写入。
 	Observatory      json.RawMessage `json:"observatory,omitempty"`
 	BurstObservatory json.RawMessage `json:"burstObservatory,omitempty"`
+	// add_user_to_rule / remove_user_from_rule:按 marktag 定位 routing rule,增删 rule.user[] 中的 email
+	Marktag   string `json:"marktag,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
 }
 
 // 处理路由管理请求。
@@ -2218,6 +2222,69 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 		routing["rules"] = rules
 		config["routing"] = routing
 
+	case "add_user_to_rule", "remove_user_from_rule":
+		// 按 marktag 定位 rule,增删其 user[] 数组里的 email。
+		// 主控用于 routed 节点的 routing rule 动态维护:套餐绑/退用户时不重建整条 rule,只改 user[]。
+		if strings.TrimSpace(req.Marktag) == "" || strings.TrimSpace(req.UserEmail) == "" {
+			writeError(w, http.StatusBadRequest, "marktag and user_email are required")
+			return
+		}
+		routing, _ := config["routing"].(map[string]interface{})
+		if routing == nil {
+			writeError(w, http.StatusBadRequest, "No routing config found")
+			return
+		}
+		rules, _ := routing["rules"].([]interface{})
+		matched := -1
+		for i, rule := range rules {
+			rm, ok := rule.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if tag, _ := rm["marktag"].(string); tag == req.Marktag {
+				matched = i
+				break
+			}
+		}
+		if matched < 0 {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("Rule with marktag=%s not found", req.Marktag))
+			return
+		}
+		rule := rules[matched].(map[string]interface{})
+		// user 字段可能不存在或为 nil
+		users := []interface{}{}
+		if existing, ok := rule["user"].([]interface{}); ok {
+			users = existing
+		}
+		if action == "add_user_to_rule" {
+			// 去重 append
+			present := false
+			for _, u := range users {
+				if s, _ := u.(string); s == req.UserEmail {
+					present = true
+					break
+				}
+			}
+			if !present {
+				users = append(users, req.UserEmail)
+			}
+		} else {
+			// remove
+			filtered := users[:0]
+			for _, u := range users {
+				if s, _ := u.(string); s != req.UserEmail {
+					filtered = append(filtered, u)
+				}
+			}
+			users = filtered
+			// 主控约定:routed 节点的 admin 占位 user 始终保留,所以这里**不会**出现空 user 数组的合法情况;
+			// 但万一被外部清空,这里不主动删 rule,保留给主控决定(防止误删)。
+		}
+		rule["user"] = users
+		rules[matched] = rule
+		routing["rules"] = rules
+		config["routing"] = routing
+
 	default:
 		writeError(w, http.StatusBadRequest, "Invalid action")
 		return
@@ -2236,9 +2303,21 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[Manage] Routing config updated")
 
+	// xray routing 不支持动态加/改 rule(没有 gRPC API),必须重启进程才能加载新配置。
+	// 这里直接重启,主控调用方无需再单独触发。
+	if err := h.RestartXray(); err != nil {
+		log.Printf("[Manage] Routing 更新后重启 Xray 失败: %v", err)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Routing updated but xray restart failed: " + err.Error(),
+			"warning": "restart_failed",
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": "Routing updated successfully. Restart Xray to apply changes.",
+		"message": "Routing updated and xray restarted",
 	})
 }
 
@@ -3698,6 +3777,95 @@ func (h *ManageHandler) HandleSwitchXrayMode(w http.ResponseWriter, r *http.Requ
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		log.Printf("[Manage] Restarting agent for xray_mode switch to %s", req.XrayMode)
+		exec.Command("systemctl", "restart", "mmw-agent").Start()
+	}()
+}
+
+// HandleSwitchListenPort 处理 POST /api/child/agent/switch-listen-port。
+// 改 config.yaml 的 listen_port + 重启 agent。重启后 agent 用新端口监听,
+// 主控下次重连按 server.ListenPort 自动用新端口。
+func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var req struct {
+		ListenPort int `json:"listen_port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	// 0 表示恢复默认(删除 listen_port 行,agent 用内置 23889);1024-65535 才作为有效端口
+	if req.ListenPort != 0 && (req.ListenPort < 1024 || req.ListenPort > 65535) {
+		writeError(w, http.StatusBadRequest, "listen_port must be 0 or in 1024-65535")
+		return
+	}
+	if h.configPath == "" {
+		writeError(w, http.StatusInternalServerError, "Config path not set")
+		return
+	}
+
+	// 预检新端口能否 bind,避免改完 config 重启后死锁
+	// (xray 或其他进程已占用 → agent HTTP server 起不来,主控触达不到 agent)
+	// 0 表示恢复默认端口 23889,同样预检
+	probePort := req.ListenPort
+	if probePort == 0 {
+		probePort = 23889
+	}
+	probeLn, err := net.Listen("tcp", fmt.Sprintf(":%d", probePort))
+	if err != nil {
+		writeError(w, http.StatusConflict, fmt.Sprintf("端口 %d 已被占用,无法切换: %v", probePort, err))
+		return
+	}
+	probeLn.Close()
+
+	data, err := os.ReadFile(h.configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Read config: %v", err))
+		return
+	}
+
+	lines := strings.Split(string(data), "\n")
+	out := make([]string, 0, len(lines)+1)
+	found := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "listen_port:") {
+			if req.ListenPort > 0 {
+				out = append(out, fmt.Sprintf("listen_port: \"%d\"", req.ListenPort))
+				found = true
+			}
+			// req.ListenPort == 0 时直接丢弃这一行(恢复默认)
+			continue
+		}
+		out = append(out, line)
+	}
+	if !found && req.ListenPort > 0 {
+		out = append(out, fmt.Sprintf("listen_port: \"%d\"", req.ListenPort))
+	}
+
+	if err := os.WriteFile(h.configPath, []byte(strings.Join(out, "\n")), 0644); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Write config: %v", err))
+		return
+	}
+	log.Printf("[Manage] Config updated: listen_port=%d", req.ListenPort)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Listen port set to %d, agent restarting...", req.ListenPort),
+	})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		log.Printf("[Manage] Restarting agent for listen_port switch to %d", req.ListenPort)
 		exec.Command("systemctl", "restart", "mmw-agent").Start()
 	}()
 }

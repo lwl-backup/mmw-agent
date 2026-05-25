@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -180,9 +181,16 @@ func main() {
 	agentClient.Start(ctx)
 
 	// 启动 HTTP 服务
+	// 先同步 bind,失败立即 fail-fast 退出进程,让 systemd 把服务标 failed
+	// (否则 ListenAndServe 失败但 WebSocket 出站还活,会造成 agent HTTP API 死、
+	//  主控误以为"在线"无法触达的死锁状态)
+	httpLn, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		log.Fatalf("[Main] HTTP server bind failed on :%s: %v", cfg.ListenPort, err)
+	}
 	go func() {
 		log.Printf("[Main] HTTP server listening on :%s", cfg.ListenPort)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(httpLn); err != nil && err != http.ErrServerClosed {
 			log.Printf("[Main] HTTP server error: %v", err)
 		}
 	}()
