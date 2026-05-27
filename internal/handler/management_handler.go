@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -3641,6 +3640,13 @@ func (h *ManageHandler) HandleAgentUpgradeStream(w http.ResponseWriter, r *http.
 		return
 	}
 	log.Printf("[Manage] Starting Agent upgrade (stream)...")
+	// 升级流程:
+	//   1. 脚本里只做"下载 + 校验 + 替换二进制",不再嵌入 `systemctl restart`
+	//      (旧实现把 systemctl restart 放在 nohup bash 里,bash 在 mmw-agent.service 的 cgroup,
+	//       systemd 杀 cgroup 时把 bash 也杀掉,/tmp 文件不会清理,且偶发不重启 — 见 port/xray_mode 切换
+	//       同款问题的修复)
+	//   2. 脚本退出 → sseStreamCmd 收到 complete → goroutine 里 os.Exit(0)
+	//   3. systemd Restart=always 拉起新二进制(/usr/local/bin/mmw-agent 已经被脚本里的 cp 覆盖)
 	script := `
 set -e
 echo "=========================================="
@@ -3656,19 +3662,36 @@ esac
 
 RELEASE_URL="https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
 echo "Downloading from $RELEASE_URL..."
-wget -q --show-progress -O /tmp/mmw-agent-new "$RELEASE_URL" || curl -fsSL -o /tmp/mmw-agent-new "$RELEASE_URL"
+wget -q --show-progress -O /tmp/mmw-agent-new "$RELEASE_URL" 2>/dev/null || curl -fsSL -o /tmp/mmw-agent-new "$RELEASE_URL"
 
 chmod +x /tmp/mmw-agent-new
 echo "Download complete, binary size: $(du -h /tmp/mmw-agent-new | cut -f1)"
 
-echo ""
-echo "Scheduling delayed replacement and restart..."
-nohup bash -c "sleep 2 && cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent && systemctl restart mmw-agent && rm -f /tmp/mmw-agent-new" >/dev/null 2>&1 &
-echo "Agent will restart in a few seconds."
+# 替换二进制(systemd Restart=always 会在 agent 退出后拉起新版本)
+cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent
+rm -f /tmp/mmw-agent-new
+echo "Binary replaced; agent will exit and systemd will restart with new version."
 `
 	cmd := exec.CommandContext(r.Context(), "bash", "-c", script)
 	cmd.Env = os.Environ()
-	sseStreamCmd(w, r, cmd, "Agent upgrade scheduled, restarting shortly")
+	// sseStreamCmd 内部 Wait() 完命令才返回,所以 script 成功跑完(包括 cp 替换二进制)后这里才走到下面
+	// 用 channel 让 sseStreamCmd 阻塞期间不退出,完成后 os.Exit。
+	streamDone := make(chan bool, 1)
+	go func() {
+		sseStreamCmd(w, r, cmd, "Agent upgraded, restarting...")
+		streamDone <- (cmd.ProcessState != nil && cmd.ProcessState.Success())
+	}()
+	success := <-streamDone
+	if !success {
+		log.Printf("[Manage] Agent upgrade script failed; not exiting")
+		return
+	}
+	// 延迟一点让 SSE complete 消息真的发到客户端,然后退出由 systemd 拉新二进制起来
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		log.Printf("[Manage] Exiting after agent upgrade (systemd will restart with new binary)")
+		os.Exit(0)
+	}()
 }
 
 func (h *ManageHandler) HandleAgentUninstallStream(w http.ResponseWriter, r *http.Request) {
@@ -3830,10 +3853,12 @@ func (h *ManageHandler) HandleSwitchXrayMode(w http.ResponseWriter, r *http.Requ
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+	// 不用 exec systemctl restart(同进程 fork 偶发不释放/不退出导致一个 PID 占多个端口);
+	// 直接 os.Exit,systemd Restart=always 拉起新实例读新 xray_mode。
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		log.Printf("[Manage] Restarting agent for xray_mode switch to %s", req.XrayMode)
-		exec.Command("systemctl", "restart", "mmw-agent").Start()
+		log.Printf("[Manage] Exiting for xray_mode switch to %s (systemd will restart)", req.XrayMode)
+		os.Exit(0)
 	}()
 }
 
@@ -3867,19 +3892,11 @@ func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 预检新端口能否 bind,避免改完 config 重启后死锁
-	// (xray 或其他进程已占用 → agent HTTP server 起不来,主控触达不到 agent)
-	// 0 表示恢复默认端口 23889,同样预检
-	probePort := req.ListenPort
-	if probePort == 0 {
-		probePort = 23889
-	}
-	probeLn, err := net.Listen("tcp", fmt.Sprintf(":%d", probePort))
-	if err != nil {
-		writeError(w, http.StatusConflict, fmt.Sprintf("端口 %d 已被占用,无法切换: %v", probePort, err))
-		return
-	}
-	probeLn.Close()
+	// 历史上这里用 net.Listen 做"预检",但同进程内打开+关闭监听存在 Go runtime / 内核
+	// epoll 句柄残留的边界情况 — 一旦后续 systemctl 重启没成功(D-Bus / unit 名异常 / 静默 fail),
+	// 老 agent 进程就会保留两个 LISTEN(原端口 + 预检端口),反映到外面就是 "同 PID 占两个端口"。
+	// 改为"信任 + 重试":只校验数字范围,写 config,然后 os.Exit 让 systemd 拉起新实例;
+	// 新实例 bind 失败由 main 里的 listenWithRetry 兜底(EADDRINUSE 重试 6 次每次 2s)。
 
 	data, err := os.ReadFile(h.configPath)
 	if err != nil {
@@ -3919,10 +3936,13 @@ func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Re
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+	// 不用 exec.Command 跑 systemctl restart —— 同进程内 fork + 子进程继承 FD + systemctl 静默失败
+	// 这一串组合会导致老 agent 没死,新端口又被预检/重启循环里某个步骤额外绑上,出现"同 PID 两个 LISTEN"。
+	// 直接 os.Exit(0):systemd 的 Restart=always 会在 RestartSec 后拉起新实例,新实例读 config.yaml 的新端口绑定。
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		log.Printf("[Manage] Restarting agent for listen_port switch to %d", req.ListenPort)
-		exec.Command("systemctl", "restart", "mmw-agent").Start()
+		log.Printf("[Manage] Exiting for listen_port switch to %d (systemd will restart)", req.ListenPort)
+		os.Exit(0)
 	}()
 }
 
@@ -3985,10 +4005,11 @@ func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Req
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+	// 不用 exec systemctl restart;直接 os.Exit,systemd Restart=always 拉起新实例。
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		log.Printf("[Manage] Restarting agent for master_url update")
-		exec.Command("systemctl", "restart", "mmw-agent").Start()
+		log.Printf("[Manage] Exiting for master_url update (systemd will restart)")
+		os.Exit(0)
 	}()
 }
 

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -207,7 +208,11 @@ func main() {
 	// 先同步 bind,失败立即 fail-fast 退出进程,让 systemd 把服务标 failed
 	// (否则 ListenAndServe 失败但 WebSocket 出站还活,会造成 agent HTTP API 死、
 	//  主控误以为"在线"无法触达的死锁状态)
-	httpLn, err := net.Listen("tcp", server.Addr)
+	//
+	// EADDRINUSE 重试:Restart=always + RestartSec=5 的快速循环里,
+	// 上一实例的 LISTEN socket 可能还没被内核完全回收;直接 fail 会触发又一轮重启循环。
+	// 这里轮询最多 ~12s,绝大多数情况下旧 FD 释放后能成功 bind。
+	httpLn, err := listenWithRetry("tcp", server.Addr, 6, 2*time.Second)
 	if err != nil {
 		log.Fatalf("[Main] HTTP server bind failed on :%s: %v", cfg.ListenPort, err)
 	}
@@ -289,6 +294,30 @@ func downloadFile(dest, url string) error {
 	}
 	f.Close()
 	return os.Rename(tmp, dest)
+}
+
+// listenWithRetry 在 EADDRINUSE 时按指定间隔重试 bind,其它错误立即返回。
+// 解决场景:agent 被 systemd 快速重启时,上一实例的 LISTEN socket 偶尔还没被内核回收;
+// 直接 fatal 会触发又一轮 5s 间隔的重启,把秒级问题拖成分钟级。
+func listenWithRetry(network, addr string, attempts int, delay time.Duration) (net.Listener, error) {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		ln, err := net.Listen(network, addr)
+		if err == nil {
+			if i > 0 {
+				log.Printf("[Main] HTTP bind succeeded on attempt %d/%d", i+1, attempts)
+			}
+			return ln, nil
+		}
+		lastErr = err
+		// 仅在端口被占用错误下重试,其它(权限/无效地址等)直接报错
+		if !strings.Contains(strings.ToLower(err.Error()), "address already in use") {
+			return nil, err
+		}
+		log.Printf("[Main] HTTP bind attempt %d/%d failed on %s (will retry in %v): %v", i+1, attempts, addr, delay, err)
+		time.Sleep(delay)
+	}
+	return nil, lastErr
 }
 
 func initXrayConfig(path string, stealMode string) {
