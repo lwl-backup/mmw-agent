@@ -1638,31 +1638,66 @@ func (h *ManageHandler) listInbounds(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ManageHandler) getInboundsFromConfig() []map[string]interface{} {
-	configPath := h.findXrayConfigPath()
-	if configPath == "" {
-		return nil
+	paths := h.findXrayConfigInfo()
+	inbounds := make([]map[string]interface{}, 0)
+
+	// 主配置文件
+	if paths.ConfigPath != "" {
+		inbounds = append(inbounds, readInboundsFromJSONFile(paths.ConfigPath)...)
 	}
 
-	content, err := os.ReadFile(configPath)
-	if err != nil {
-		log.Printf("[Manage] Failed to read config file: %v", err)
-		return nil
-	}
-
-	var config map[string]interface{}
-	if err := json.Unmarshal(content, &config); err != nil {
-		log.Printf("[Manage] Failed to parse config: %v", err)
-		return nil
-	}
-
-	rawInbounds, _ := config["inbounds"].([]interface{})
-	inbounds := make([]map[string]interface{}, 0, len(rawInbounds))
-	for _, ib := range rawInbounds {
-		if ibMap, ok := ib.(map[string]interface{}); ok {
-			inbounds = append(inbounds, ibMap)
+	// confdir 下的所有 *.json — xray 启动时 -confdir 会把它们合并进配置,
+	// 老版 mmw 风格的服务器把每个 inbound 拆成单文件(如 Shadowsocks-25443.json)放这里。
+	// 不读 confdir 会导致这些 inbound 在 listInbounds 里只能从 gRPC 拿到 tag 而拿不到 settings/port/protocol,
+	// 进而让主控的 sync_inbounds 全部 skip 掉(no settings found)。
+	if paths.ConfDir != "" {
+		entries, err := os.ReadDir(paths.ConfDir)
+		if err == nil {
+			for _, e := range entries {
+				if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
+					continue
+				}
+				inbounds = append(inbounds, readInboundsFromJSONFile(filepath.Join(paths.ConfDir, e.Name()))...)
+			}
+		} else {
+			log.Printf("[Manage] Failed to read confdir %s: %v", paths.ConfDir, err)
 		}
 	}
+
 	return inbounds
+}
+
+// readInboundsFromJSONFile 读单个 xray 风格 JSON 文件,返回其中 inbounds 数组(可能为空)。
+// 支持两种结构:
+//  1. 完整 xray 配置:{ "inbounds": [ ... ] }
+//  2. 单 inbound 文件:{ "tag": "...", "port": ..., "protocol": ..., "settings": {...} } — 老 mmw confdir 常用
+func readInboundsFromJSONFile(path string) []map[string]interface{} {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("[Manage] Failed to read %s: %v", path, err)
+		return nil
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(content, &raw); err != nil {
+		log.Printf("[Manage] Failed to parse %s: %v", path, err)
+		return nil
+	}
+
+	if arr, ok := raw["inbounds"].([]interface{}); ok {
+		result := make([]map[string]interface{}, 0, len(arr))
+		for _, ib := range arr {
+			if m, ok := ib.(map[string]interface{}); ok {
+				result = append(result, m)
+			}
+		}
+		return result
+	}
+
+	// 单 inbound 文件 — 用 protocol 字段做判定(xray inbound 必须有 protocol)
+	if _, ok := raw["protocol"].(string); ok {
+		return []map[string]interface{}{raw}
+	}
+	return nil
 }
 
 func (h *ManageHandler) getInboundTagsFromGRPC() []string {
@@ -2324,6 +2359,13 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 // ================== 辅助函数 ==================
 
 func (h *ManageHandler) findXrayConfigPath() string {
+	// embedded 模式下,Discover 找不到运行中的外置 xray 进程(没了)/systemd unit 指的是已归档路径(无效),
+	// 会回退到 static paths;但更直接的是用 embedded 的标准路径,跟启动时一致。
+	if h.xrayMode == "embedded" {
+		if p := constants.DefaultXrayConfigPaths[0]; fileExists(p) {
+			return p
+		}
+	}
 	p := discovery.Discover()
 	if p.ConfigPath != "" {
 		return p.ConfigPath
@@ -2332,7 +2374,21 @@ func (h *ManageHandler) findXrayConfigPath() string {
 }
 
 func (h *ManageHandler) findXrayConfigInfo() discovery.XrayPaths {
+	if h.xrayMode == "embedded" {
+		p := constants.DefaultXrayConfigPaths[0]
+		if fileExists(p) {
+			return discovery.XrayPaths{ConfigPath: p}
+		}
+	}
 	return discovery.Discover()
+}
+
+func fileExists(p string) bool {
+	if p == "" {
+		return false
+	}
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func (h *ManageHandler) findXrayAPIPort() int {
