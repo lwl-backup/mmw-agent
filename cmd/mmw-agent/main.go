@@ -318,8 +318,9 @@ func listenWithRetry(network, addr string, attempts int, delay time.Duration) (n
 			return nil, err
 		}
 		log.Printf("[Main] HTTP bind attempt %d/%d failed on %s (will retry in %v): %v", i+1, attempts, addr, delay, err)
-		// 重试到一半还失败,杀掉别的 mmw-agent 进程(自己除外)
-		if i == attempts/2 {
+		// 第一次失败就立即扫并杀掉别的 mmw-agent 进程 — systemctl restart 没杀干净老 agent
+		// 是最常见的占港原因,等到第 4 次再杀让用户等 8s 没必要
+		if i == 0 {
 			if n := killOtherMmwAgentProcesses(); n > 0 {
 				log.Printf("[Main] Killed %d orphan mmw-agent process(es), retrying bind", n)
 			}
