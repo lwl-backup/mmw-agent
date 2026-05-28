@@ -1626,6 +1626,11 @@ func (h *ManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ManageHandler) listInbounds(w http.ResponseWriter, r *http.Request) {
+	// 老 mmw / 手写 xray config 里 inbound 可能没 tag,后续主控做 remove+add 时找不到 → 配置里残留旧 inbound 同端口 → xray 启动失败。
+	// 不在内存里"虚拟一个 tag",而是直接把生成的 tag 写回到磁盘配置,把脏数据修干净,后续所有 remove/add 都按真实 tag 走。
+	// 整个 list 流程现在的"读"步骤会带轻量"写",但只在真的有 inbound 缺 tag 时才真改文件,常规情况无副作用。
+	h.promoteInboundTagsToConfig()
+
 	configInbounds := h.getInboundsFromConfig()
 	runtimeTags := h.getInboundTagsFromGRPC()
 	mergedInbounds := h.mergeInbounds(configInbounds, runtimeTags)
@@ -1634,6 +1639,110 @@ func (h *ManageHandler) listInbounds(w http.ResponseWriter, r *http.Request) {
 		"success":  true,
 		"inbounds": mergedInbounds,
 	})
+}
+
+// PromoteAllTagsOnStartup agent 启动时调用一次,把缺 tag 的 inbound/outbound 当场写回磁盘,
+// 不依赖 listInbounds / listOutbounds 被调用。list 端点里的兜底逻辑保留(防止配置在 agent 启动
+// 后被手动改回缺 tag 状态)。
+func (h *ManageHandler) PromoteAllTagsOnStartup() {
+	h.promoteInboundTagsToConfig()
+	if cfg := h.findXrayConfigPath(); cfg != "" {
+		promoteOutboundTagsInFile(cfg)
+	}
+}
+
+// promoteInboundTagsToConfig 扫所有 xray 配置(主 config + confdir),
+// 把缺 tag 但有 protocol+port 的 inbound 原地补 tag = "<protocol>-<port>",再 marshal 写回原文件。
+// 已有 tag 的不动;无 protocol/port 的(异常 inbound)也不动,避免破坏边界情况。
+// 失败只记日志不阻塞 — 拿不到 tag 比 mmwx 直接 panic 要好。
+func (h *ManageHandler) promoteInboundTagsToConfig() {
+	paths := h.findXrayConfigInfo()
+	if paths.ConfigPath != "" {
+		promoteInboundTagsInFile(paths.ConfigPath)
+	}
+	if paths.ConfDir != "" {
+		entries, err := os.ReadDir(paths.ConfDir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
+				continue
+			}
+			promoteInboundTagsInFile(filepath.Join(paths.ConfDir, e.Name()))
+		}
+	}
+}
+
+// promoteInboundTagsInFile 处理单个 xray 配置 JSON 文件,补 tag 后写回。支持两种结构:
+//  1. 完整配置 {"inbounds":[...]}
+//  2. 单 inbound 文件 {"protocol":...,"port":...}
+func promoteInboundTagsInFile(path string) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(content, &raw); err != nil {
+		return
+	}
+	changed := false
+	if arr, ok := raw["inbounds"].([]interface{}); ok {
+		for i, ib := range arr {
+			m, ok := ib.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if promoteOneInboundTag(m) {
+				arr[i] = m
+				changed = true
+			}
+		}
+		if changed {
+			raw["inbounds"] = arr
+		}
+	} else if _, ok := raw["protocol"].(string); ok {
+		if promoteOneInboundTag(raw) {
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	newContent, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		log.Printf("[Manage] promote inbound tags: marshal %s failed: %v", path, err)
+		return
+	}
+	if err := os.WriteFile(path, newContent, 0644); err != nil {
+		log.Printf("[Manage] promote inbound tags: write %s failed: %v", path, err)
+		return
+	}
+	log.Printf("[Manage] promote inbound tags: persisted generated tags into %s", path)
+}
+
+// promoteOneInboundTag 给单个 inbound map 补 tag。返回 true 表示真的改了。
+func promoteOneInboundTag(m map[string]interface{}) bool {
+	tag, _ := m["tag"].(string)
+	if tag != "" {
+		return false
+	}
+	protocol, _ := m["protocol"].(string)
+	if protocol == "" {
+		return false
+	}
+	port := 0
+	switch p := m["port"].(type) {
+	case float64:
+		port = int(p)
+	case int:
+		port = p
+	}
+	if port <= 0 {
+		return false
+	}
+	m["tag"] = fmt.Sprintf("%s-%d", protocol, port)
+	return true
 }
 
 func (h *ManageHandler) getInboundsFromConfig() []map[string]interface{} {
@@ -2016,6 +2125,9 @@ func (h *ManageHandler) listOutbounds(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 同 listInbounds:把缺 tag 的 outbound 补 tag 写回磁盘,避免主控做 remove+add 因找不到 tag 留下重复 outbound。
+	promoteOutboundTagsInFile(configPath)
+
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to read config: %v", err))
@@ -2034,6 +2146,55 @@ func (h *ManageHandler) listOutbounds(w http.ResponseWriter, r *http.Request) {
 		"success":   true,
 		"outbounds": outbounds,
 	})
+}
+
+// promoteOutboundTagsInFile 处理 xray 主配置里 outbound 缺 tag 的情况。
+// 与 inbound 不同,outbound 没有 port 概念,落地 tag 用 `<protocol>-<index>`,index 是它在 outbounds 数组里的位置。
+// 主要兜底场景:freedom/blackhole 等内置 outbound 用户可能手动添加时漏写 tag。
+func promoteOutboundTagsInFile(configPath string) {
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	var config map[string]interface{}
+	if err := json.Unmarshal(content, &config); err != nil {
+		return
+	}
+	arr, ok := config["outbounds"].([]interface{})
+	if !ok {
+		return
+	}
+	changed := false
+	for i, ob := range arr {
+		m, ok := ob.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if tag, _ := m["tag"].(string); tag != "" {
+			continue
+		}
+		protocol, _ := m["protocol"].(string)
+		if protocol == "" {
+			continue
+		}
+		m["tag"] = fmt.Sprintf("%s-%d", protocol, i)
+		arr[i] = m
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	config["outbounds"] = arr
+	newContent, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		log.Printf("[Manage] promote outbound tags: marshal %s failed: %v", configPath, err)
+		return
+	}
+	if err := os.WriteFile(configPath, newContent, 0644); err != nil {
+		log.Printf("[Manage] promote outbound tags: write %s failed: %v", configPath, err)
+		return
+	}
+	log.Printf("[Manage] promote outbound tags: persisted generated tags into %s", configPath)
 }
 
 func (h *ManageHandler) manageOutbound(w http.ResponseWriter, r *http.Request) {

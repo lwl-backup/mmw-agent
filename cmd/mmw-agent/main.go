@@ -148,6 +148,11 @@ func main() {
 		}
 	}
 
+	// 启动时立刻把缺 tag 的 inbound/outbound 补 tag 写回 xray 配置,不依赖 list 端点触发。
+	// list 端点里的同名兜底也保留,作 defense-in-depth(配置后续被手改回缺 tag 时仍能修)。
+	// 注:放在 EnsureXrayConfig + 可能的 RestartXray 之后,确保 xray 配置已就位、路径稳定。
+	manageHandler.PromoteAllTagsOnStartup()
+
 	// 创建 agent 客户端
 	agentClient := agent.NewClient(cfg)
 	if embeddedXray != nil {
