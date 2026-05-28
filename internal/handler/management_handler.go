@@ -2105,8 +2105,40 @@ func (h *ManageHandler) manageOutbound(w http.ResponseWriter, r *http.Request) {
 			"message": "Outbound removed successfully",
 		})
 
+	case "update":
+		// 更新 = 在 xray 运行时 remove + add(顺序不影响 routing 命中,xray 按 tag 查);
+		// 持久化时按原 index 替换,保留它在 config 文件里的位置 — 这样前端列表不再被甩到末尾。
+		if req.Outbound == nil {
+			writeError(w, http.StatusBadRequest, "Outbound payload is required for update action")
+			return
+		}
+		newTag, _ := req.Outbound["tag"].(string)
+		if newTag == "" {
+			writeError(w, http.StatusBadRequest, "Outbound tag is required for update action")
+			return
+		}
+		// req.Tag 可选:旧 tag(若改名),为空表示 tag 没变,直接按 newTag 找位置
+		oldTag := req.Tag
+		if oldTag == "" {
+			oldTag = newTag
+		}
+		if err := h.removeOutbound(ctx, clients.Handler, oldTag); err != nil {
+			log.Printf("[Manage] update: remove old %q failed (continuing to add new): %v", oldTag, err)
+		}
+		if err := h.addOutbound(ctx, clients.Handler, req.Outbound); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to add updated outbound: %v", err))
+			return
+		}
+		if err := h.replaceOutboundInConfig(oldTag, req.Outbound); err != nil {
+			log.Printf("[Manage] Warning: Failed to replace outbound in config: %v", err)
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Outbound updated successfully",
+		})
+
 	default:
-		writeError(w, http.StatusBadRequest, "Invalid action. Must be 'add' or 'remove'")
+		writeError(w, http.StatusBadRequest, "Invalid action. Must be 'add', 'remove' or 'update'")
 	}
 }
 
@@ -2584,6 +2616,45 @@ func (h *ManageHandler) persistOutbound(outbound map[string]interface{}) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
+	return os.WriteFile(configPath, newContent, 0644)
+}
+
+// replaceOutboundInConfig 按 oldTag 找到现有 outbound,在原位置原地替换为新 outbound;
+// 找不到则追加在末尾(保持与 add 行为一致)。这是为了让 UI 编辑保存后,出站不会被甩到列表末尾。
+func (h *ManageHandler) replaceOutboundInConfig(oldTag string, outbound map[string]interface{}) error {
+	configPath := h.findXrayConfigPath()
+	if configPath == "" {
+		return fmt.Errorf("config file not found")
+	}
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to read config: %w", err)
+	}
+	var config map[string]interface{}
+	if err := json.Unmarshal(content, &config); err != nil {
+		return fmt.Errorf("failed to parse config: %w", err)
+	}
+	outbounds, _ := config["outbounds"].([]interface{})
+	replaced := false
+	for i, ob := range outbounds {
+		om, ok := ob.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := om["tag"].(string); t == oldTag {
+			outbounds[i] = outbound
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		outbounds = append(outbounds, outbound)
+	}
+	config["outbounds"] = outbounds
+	newContent, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
 	return os.WriteFile(configPath, newContent, 0644)
 }
 
