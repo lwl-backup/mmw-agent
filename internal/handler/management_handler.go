@@ -2577,9 +2577,25 @@ func (h *ManageHandler) removeInboundFromConfig(tag string) error {
 			continue
 		}
 		ibTag, _ := inbound["tag"].(string)
-		if ibTag != tag {
-			newInbounds = append(newInbounds, ib)
+		if ibTag == tag {
+			continue // 精确匹配 → 删
 		}
+		// listInbounds 会给 tag 缺失的 inbound 虚拟一个 `<protocol>-<port>` tag 让前端能引用,
+		// remove 时也要识别这种虚拟 tag,否则原 inbound 永远删不掉 → mmwx 再 add 一份 → 同端口两份 inbound → xray 启动失败
+		if ibTag == "" {
+			proto, _ := inbound["protocol"].(string)
+			port := 0
+			switch p := inbound["port"].(type) {
+			case float64:
+				port = int(p)
+			case int:
+				port = p
+			}
+			if proto != "" && port > 0 && tag == fmt.Sprintf("%s-%d", proto, port) {
+				continue
+			}
+		}
+		newInbounds = append(newInbounds, ib)
 	}
 	config["inbounds"] = newInbounds
 
