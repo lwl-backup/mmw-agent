@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"syscall"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"mmw-agent/internal/discovery"
 	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/limiter"
+	"mmw-agent/internal/version"
 	"mmw-agent/internal/xrayctl"
 	"mmw-agent/internal/xrpc"
 
@@ -1193,7 +1195,8 @@ func (h *ManageHandler) HandleSystemInfo(w http.ResponseWriter, r *http.Request)
 	}
 
 	info := map[string]interface{}{
-		"success": true,
+		"success":       true,
+		"agent_version": version.Version, // 主控用这个对比 GitHub latest tag 决定是否提示升级
 	}
 
 	if hostname, err := os.Hostname(); err == nil {
@@ -4197,12 +4200,63 @@ echo "Binary replaced; agent will exit and systemd will restart with new version
 		log.Printf("[Manage] Agent upgrade script failed; not exiting")
 		return
 	}
-	// 延迟一点让 SSE complete 消息真的发到客户端,然后退出由 systemd 拉新二进制起来
+	// 延迟一点让 SSE complete 消息真的发到客户端,再退出。
+	// 默认假设有 systemd 拉起新二进制;LXC 等无 systemd 环境(`/run/systemd/system` 不存在或服务未注册)
+	// 退出后没人接管 → 手动 detach 一个新进程 sleep 2s 后 exec 新二进制,跨过当前进程退出释放端口的窗口。
+	// 注:systemd 模式下不 detach,避免与 systemd 的 restart 抢端口。
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		log.Printf("[Manage] Exiting after agent upgrade (systemd will restart with new binary)")
+		if systemdWillRestartAgent() {
+			log.Printf("[Manage] Exiting after agent upgrade (systemd will restart with new binary)")
+		} else {
+			log.Printf("[Manage] No systemd-managed agent service detected; scheduling self-respawn")
+			scheduleSelfRespawn()
+		}
 		os.Exit(0)
 	}()
+}
+
+// systemdWillRestartAgent 判断当前 agent 是否由 systemd 管理且会自动 restart。
+// 两个条件同时满足:
+//   - /run/systemd/system 存在(说明 init 是 systemd)
+//   - systemctl is-active mmw-agent 返回成功(说明这个服务在被管理)
+// LXC / docker / openrc / nohup 等任一不满足就走自重启分支。
+func systemdWillRestartAgent() bool {
+	if _, err := os.Stat("/run/systemd/system"); err != nil {
+		return false
+	}
+	out, err := exec.Command("systemctl", "is-active", "mmw-agent").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "active"
+}
+
+// scheduleSelfRespawn 在当前进程退出前 fork 一个完全脱离的子进程,
+// 子进程 sleep 2s 后 exec 新二进制(此时旧进程已退出,端口可用)。
+// Setsid 让子进程脱离当前会话/进程组,父进程退出后不会被收走。
+func scheduleSelfRespawn() {
+	if len(os.Args) == 0 {
+		log.Printf("[Manage] self-respawn: os.Args empty, skip")
+		return
+	}
+	// 用 /bin/sh 包一层 sleep + exec,确保旧进程退出释放端口后再启动新进程。
+	// 单引号包路径 / 参数 — 防 shell 元字符;若参数本身含单引号,exec 会失败但 systemd 路径也会同样失败,极少见。
+	quoted := make([]string, len(os.Args))
+	for i, a := range os.Args {
+		quoted[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+	}
+	script := "sleep 2; exec " + strings.Join(quoted, " ")
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		log.Printf("[Manage] self-respawn: start failed: %v", err)
+		return
+	}
+	log.Printf("[Manage] self-respawn: detached pid=%d will exec new binary in 2s", cmd.Process.Pid)
 }
 
 func (h *ManageHandler) HandleAgentUninstallStream(w http.ResponseWriter, r *http.Request) {
