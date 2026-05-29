@@ -2955,6 +2955,277 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ================== Batch Apply ==================
+
+// BatchInboundClient 描述一个 add-client 操作。
+type BatchInboundClient struct {
+	Tag    string                 `json:"tag"`
+	Client map[string]interface{} `json:"client"`
+}
+
+// BatchRoutingAddition 描述一个 routing rule add-user 操作。
+// marktag 优先匹配(legacy 路径),outbound_tag fallback(auto-detected)。
+type BatchRoutingAddition struct {
+	Marktag     string `json:"marktag,omitempty"`
+	OutboundTag string `json:"outbound_tag,omitempty"`
+	UserEmail   string `json:"user_email"`
+}
+
+// BatchApplyRequest 一次性提交多个 inbound add-client + routing rule add-user 操作。
+// 在 inboundsMu 锁内单次读 config + 单次写盘 + per-inbound runtime apply 完成。
+type BatchApplyRequest struct {
+	InboundClients       []BatchInboundClient   `json:"inbound_clients,omitempty"`
+	RoutingUserAdditions []BatchRoutingAddition `json:"routing_user_additions,omitempty"`
+	// NoRestart=true 时改完 routing 不自动重启 xray(主控统一末尾重启)。
+	NoRestart bool `json:"no_restart,omitempty"`
+}
+
+// BatchApplyResult 返回每条改动的结果,以及最终的运行时/重启状态。
+type BatchApplyResult struct {
+	Success         bool     `json:"success"`
+	InboundResults  []string `json:"inbound_results,omitempty"`  // 与 InboundClients 一一对应,"ok"/"err: xxx"
+	RoutingResults  []string `json:"routing_results,omitempty"`  // 与 RoutingUserAdditions 一一对应
+	RuntimeWarnings []string `json:"runtime_warnings,omitempty"` // replaceRuntimeInbound 失败提示
+	RoutingChanged  bool     `json:"routing_changed,omitempty"`  // 是否真改了 routing(决定 caller 是否需要重启)
+	RestartedXray   bool     `json:"restarted_xray,omitempty"`
+	Message         string   `json:"message,omitempty"`
+}
+
+// applyAddClientToConfig 在内存中的 xray config 上加 client(幂等),不写盘。
+// 返回该 inbound 的 map(供 caller 后续 replaceRuntimeInbound 用),已存在或未变也返回该 map。
+func applyAddClientToConfig(config map[string]interface{}, tag string, client map[string]interface{}) (map[string]interface{}, bool, error) {
+	inbounds, _ := config["inbounds"].([]interface{})
+	for _, ib := range inbounds {
+		m, ok := ib.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := m["tag"].(string); t != tag {
+			continue
+		}
+		protocol, _ := m["protocol"].(string)
+		settings, _ := m["settings"].(map[string]interface{})
+		if settings == nil {
+			settings = map[string]interface{}{}
+			m["settings"] = settings
+		}
+		var arrKey string
+		switch strings.ToLower(protocol) {
+		case "vless", "vmess", "trojan", "shadowsocks", "hysteria":
+			arrKey = "clients"
+		case "socks", "http":
+			arrKey = "accounts"
+		default:
+			return nil, false, fmt.Errorf("unsupported protocol: %s", protocol)
+		}
+		arr, _ := settings[arrKey].([]interface{})
+		// 幂等
+		for _, c := range arr {
+			if cm, ok := c.(map[string]interface{}); ok && matchClientCredential(cm, client, protocol) {
+				return m, false, nil // 已存在,inbound 未变
+			}
+		}
+		arr = append(arr, client)
+		settings[arrKey] = arr
+		return m, true, nil
+	}
+	return nil, false, fmt.Errorf("inbound %s not found", tag)
+}
+
+// applyAddUserToRouteInConfig 在 config["routing"].rules 中按 marktag / outboundTag 找匹配 rule,
+// 把 userEmail 去重 append 到 rule.user[]。
+// 返回是否真的改了(false = 已存在,跳过)。
+func applyAddUserToRouteInConfig(config map[string]interface{}, marktag, outboundTag, userEmail string) (bool, error) {
+	if strings.TrimSpace(userEmail) == "" {
+		return false, fmt.Errorf("user_email is empty")
+	}
+	if strings.TrimSpace(marktag) == "" && strings.TrimSpace(outboundTag) == "" {
+		return false, fmt.Errorf("marktag or outbound_tag required")
+	}
+	routing, _ := config["routing"].(map[string]interface{})
+	if routing == nil {
+		return false, fmt.Errorf("no routing config")
+	}
+	rules, _ := routing["rules"].([]interface{})
+	matched := -1
+	for i, ru := range rules {
+		rm, ok := ru.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if marktag != "" {
+			if mt, _ := rm["marktag"].(string); mt == marktag {
+				matched = i
+				break
+			}
+		} else if outboundTag != "" {
+			if t, _ := rm["outboundTag"].(string); t == outboundTag {
+				matched = i
+				break
+			}
+		}
+	}
+	if matched < 0 {
+		return false, fmt.Errorf("rule not found marktag=%q outboundTag=%q", marktag, outboundTag)
+	}
+	rule := rules[matched].(map[string]interface{})
+	users := []interface{}{}
+	if existing, ok := rule["user"].([]interface{}); ok {
+		users = existing
+	}
+	for _, u := range users {
+		if s, _ := u.(string); s == userEmail {
+			return false, nil // 已存在,幂等
+		}
+	}
+	rule["user"] = append(users, userEmail)
+	rules[matched] = rule
+	routing["rules"] = rules
+	config["routing"] = routing
+	return true, nil
+}
+
+// HandleBatchApply 一次性提交多个 inbound 加 client + routing rule 加 user。
+// 在 inboundsMu 锁内单次读 config → 内存修改 → 单次写盘 → per-inbound runtime apply。
+// 用于套餐绑用户:同台 server 上多个 routed 节点的所有改动合并成 1 次 round-trip。
+func (h *ManageHandler) HandleBatchApply(w http.ResponseWriter, r *http.Request) {
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	var req BatchApplyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if len(req.InboundClients) == 0 && len(req.RoutingUserAdditions) == 0 {
+		writeJSON(w, http.StatusOK, BatchApplyResult{Success: true, Message: "nothing to apply"})
+		return
+	}
+
+	h.inboundsMu.Lock()
+	defer h.inboundsMu.Unlock()
+
+	configPath := h.findXrayConfigPath()
+	if configPath == "" {
+		writeError(w, http.StatusNotFound, "Xray config not found")
+		return
+	}
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("read config: %v", err))
+		return
+	}
+	var config map[string]interface{}
+	if err := json.Unmarshal(content, &config); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("parse config: %v", err))
+		return
+	}
+
+	result := BatchApplyResult{
+		InboundResults: make([]string, len(req.InboundClients)),
+		RoutingResults: make([]string, len(req.RoutingUserAdditions)),
+	}
+	// 受影响 inbound 收集起来:写盘后逐个 replaceRuntimeInbound,而不是每加一个 client 都 reload。
+	affectedInbounds := map[string]map[string]interface{}{}
+	inboundChanged := false
+
+	for i, item := range req.InboundClients {
+		if item.Tag == "" || item.Client == nil {
+			result.InboundResults[i] = "err: tag and client required"
+			continue
+		}
+		target, changed, err := applyAddClientToConfig(config, item.Tag, item.Client)
+		if err != nil {
+			result.InboundResults[i] = "err: " + err.Error()
+			continue
+		}
+		if changed {
+			inboundChanged = true
+			affectedInbounds[item.Tag] = target
+			result.InboundResults[i] = "ok"
+		} else {
+			result.InboundResults[i] = "ok (no-op)"
+		}
+	}
+
+	routingChanged := false
+	for i, item := range req.RoutingUserAdditions {
+		changed, err := applyAddUserToRouteInConfig(config, item.Marktag, item.OutboundTag, item.UserEmail)
+		if err != nil {
+			result.RoutingResults[i] = "err: " + err.Error()
+			continue
+		}
+		if changed {
+			routingChanged = true
+			result.RoutingResults[i] = "ok"
+		} else {
+			result.RoutingResults[i] = "ok (no-op)"
+		}
+	}
+	result.RoutingChanged = routingChanged
+
+	if !inboundChanged && !routingChanged {
+		// 全是幂等 no-op,跳过写盘和重启
+		result.Success = true
+		result.Message = "all no-op, config unchanged"
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+
+	// 写盘前最后一道兜底:把整个 inbounds/outbounds 数组按 tag 去重。
+	dedupeTaggedArrayInPlace(config, "inbounds")
+	dedupeTaggedArrayInPlace(config, "outbounds")
+
+	newContent, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("marshal config: %v", err))
+		return
+	}
+	tmp := configPath + ".tmp"
+	if err := os.WriteFile(tmp, newContent, 0644); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("write tmp config: %v", err))
+		return
+	}
+	if err := os.Rename(tmp, configPath); err != nil {
+		os.Remove(tmp)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("rename config: %v", err))
+		return
+	}
+
+	// 运行时应用:对每个改过的 inbound 做一次 replaceRuntimeInbound。失败只警告,不打断。
+	if inboundChanged {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for tag, target := range affectedInbounds {
+			if err := h.replaceRuntimeInbound(ctx, tag, target); err != nil {
+				log.Printf("[BatchApply] runtime apply tag=%s failed: %v", tag, err)
+				result.RuntimeWarnings = append(result.RuntimeWarnings, fmt.Sprintf("%s: %v", tag, err))
+			}
+		}
+	}
+
+	// routing 改动需要 xray restart 才能生效;NoRestart=true 时由 caller 统一末尾重启。
+	if routingChanged && !req.NoRestart {
+		if err := h.RestartXray(); err != nil {
+			log.Printf("[BatchApply] restart xray failed: %v", err)
+			result.Message = "config persisted, xray restart failed: " + err.Error()
+		} else {
+			result.RestartedXray = true
+		}
+	}
+
+	result.Success = true
+	if result.Message == "" {
+		result.Message = fmt.Sprintf("applied %d inbound + %d routing changes", len(affectedInbounds), len(req.RoutingUserAdditions))
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 // ================== 辅助函数 ==================
 
 func (h *ManageHandler) findXrayConfigPath() string {
