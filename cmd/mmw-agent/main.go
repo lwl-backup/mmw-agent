@@ -75,6 +75,17 @@ func main() {
 	manageHandler.SetConfigPath(cfgFile)
 	manageHandler.SetXrayMode(cfg.XrayMode)
 
+	// geoip.dat / geosite.dat 不分 mode 都要准备好 — 主控的 xray test-config 在 external mode
+	// 下若 LookPath("xray") 失败(典型: xray 还在 install 流程中)会 fallback 走 xray-core 库
+	// 解析,这条路径解析 `geoip:cn` 之类规则时必须能找到 dat 文件,否则 test 报错
+	// "open /usr/local/bin/geoip.dat: no such file or directory",主控首次 auto-deploy
+	// tunnel 配置直接失败。external mode 异步下载(不阻塞 agent 启动,有就跳过);
+	// embedded mode 必须同步 — 内嵌 xray instance.New 会预解析 routing,无 dat 就 panic,
+	// 同步那段在下面 embedded 分支里另起调用。
+	if cfg.XrayMode != "embedded" {
+		go ensureGeoData()
+	}
+
 	// 嵌入模式：启动内嵌 Xray 实例
 	var embeddedXray *embedded.EmbeddedXray
 	if cfg.XrayMode == "embedded" {
