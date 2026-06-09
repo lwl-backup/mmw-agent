@@ -26,6 +26,7 @@ import (
 	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/handler"
 	"mmw-agent/internal/securechan"
+	"mmw-agent/internal/warp"
 )
 
 func main() {
@@ -75,6 +76,14 @@ func main() {
 	manageHandler := handler.NewManageHandler(cfg.Token, cfg.RestartMethod, cfg.RestartCommand)
 	manageHandler.SetConfigPath(cfgFile)
 	manageHandler.SetXrayMode(cfg.XrayMode)
+
+	// WARP 服务 — 状态文件 warp.json 跟 config.yaml 同目录(空 cfgFile 时用当前工作目录)
+	warpWorkDir := "."
+	if cfgFile != "" {
+		warpWorkDir = filepath.Dir(cfgFile)
+	}
+	warpService := warp.NewService(warpWorkDir)
+	warpHandler := handler.NewWarpHandler(cfg.Token, warpService, manageHandler)
 
 	// geoip.dat / geosite.dat 不分 mode 都要准备好 — 主控的 xray test-config 在 external mode
 	// 下若 LookPath("xray") 失败(典型: xray 还在 install 流程中)会 fallback 走 xray-core 库
@@ -170,6 +179,8 @@ func main() {
 	if embeddedXray != nil {
 		agentClient.SetEmbeddedXray(embeddedXray)
 	}
+	// 注入 WARP 状态查询回调,让 auth/heartbeat 上报 warp_installed
+	agentClient.SetWarpStatusFn(warpService.IsInstalled)
 	manageHandler.OnEmbeddedXrayStart(func(ex *embedded.EmbeddedXray) {
 		agentClient.SetEmbeddedXray(ex)
 	})
@@ -185,7 +196,7 @@ func main() {
 
 	// 注册 HTTP 路由
 	mux := http.NewServeMux()
-	handler.RegisterChildRoutes(mux, apiHandler, manageHandler)
+	handler.RegisterChildRoutes(mux, apiHandler, manageHandler, warpHandler)
 
 	// 注入 mux 给 client,让 WS RPC 路径(master 反向调用)能复用同一份 /api/child/* handler
 	// 实例。共享 mux 意味着 handler 任何后续 bug fix 都同时覆盖 HTTP 和 WS RPC 路径。

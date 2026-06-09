@@ -7,7 +7,8 @@ import (
 )
 
 // 注册子端 API 路由
-func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandler *ManageHandler) {
+// warpHandler 可选,为 nil 时不注册 WARP 相关 endpoint(向后兼容老版本部署)。
+func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandler *ManageHandler, warpHandler *WarpHandler) {
 	// 拉取模式数据接口
 	mux.HandleFunc(constants.PathChildTraffic, apiHandler.ServeHTTP)
 	mux.HandleFunc(constants.PathChildSpeed, apiHandler.ServeSpeedHTTP)
@@ -49,4 +50,12 @@ func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandl
 	mux.HandleFunc(constants.PathChildNginxRemoveSSE, manageHandler.HandleNginxRemoveStream)
 	mux.HandleFunc(constants.PathChildAgentUpgradeStream, manageHandler.HandleAgentUpgradeStream)
 	mux.HandleFunc(constants.PathChildAgentUninstallStream, manageHandler.HandleAgentUninstallStream)
+
+	// WARP 出站管理 — 老版本部署 warpHandler 为 nil 时跳过(不影响其他功能)
+	if warpHandler != nil {
+		mux.HandleFunc(constants.PathChildWarpInstall, warpHandler.HandleInstall)
+		mux.HandleFunc(constants.PathChildWarpStatus, warpHandler.HandleStatus)
+		mux.HandleFunc(constants.PathChildWarpLicense, warpHandler.HandleLicense)
+		mux.HandleFunc(constants.PathChildWarpRemove, warpHandler.HandleRemove)
+	}
 }

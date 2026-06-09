@@ -97,22 +97,105 @@ type Client struct {
 	httpSession   *securechan.Session
 	httpSessionMu sync.Mutex
 
-	// 公网 IPv4 缓存(也可能装 v6,见 detectPublicIPv4 注释)
+	// 公网 IPv4 / IPv6 缓存。后台 ipProbeLoop goroutine 持续 detect 直到拿到,
+	// 心跳 / auth 直接读缓存(不阻塞)。ipMu 保护并发读写。
+	ipMu       sync.RWMutex
 	publicIPv4 string
-
-	// dual-stack v6 缓存:独立于 publicIPv4 的 v6-only 探测结果,
-	// 心跳和 auth 时上报,供 master 反向 HTTP 在 v4 失败时 fallback。
 	publicIPv6 string
 
 	// 反向 RPC 路由表 — 跟普通 HTTP mux 共享同一份 /api/child/* handler 实例,
 	// 区别仅在请求是从 WS 帧解出来构造的 *http.Request,而不是从 net.Listener 收来的。
 	// nil = 主程序未注入 → handleRPCCall 直接报 503 错回 master,master 自动 fallback HTTP。
 	rpcMux *http.ServeMux
+
+	// warpStatusFn 返回 agent 当前 WARP 是否已注册。auth + heartbeat 时调用上报给 master,
+	// 供 master 显示 server 卡片的 W 图标 badge。nil = 老 agent / 未注入 → 上报 false。
+	warpStatusFn func() bool
 }
 
 // SetRPCMux 由 main.go 在注册完 /api/child/* 路由后注入。共享 mux 让 WS RPC 路径完全复用现有 handler。
 func (c *Client) SetRPCMux(mux *http.ServeMux) {
 	c.rpcMux = mux
+}
+
+// SetWarpStatusFn 注入"查 WARP 是否已注册"的回调,auth / heartbeat 上报用。
+func (c *Client) SetWarpStatusFn(fn func() bool) {
+	c.warpStatusFn = fn
+}
+
+// getPublicIPv4 / getPublicIPv6 是 ipMu 保护的读取器,供 auth / heartbeat 调用。
+func (c *Client) getPublicIPv4() string {
+	c.ipMu.RLock()
+	defer c.ipMu.RUnlock()
+	return c.publicIPv4
+}
+func (c *Client) getPublicIPv6() string {
+	c.ipMu.RLock()
+	defer c.ipMu.RUnlock()
+	return c.publicIPv6
+}
+
+// startIPProbeLoop 后台持续 detect 出口 v4 / v6,直到拿到才停。
+// 启动时立即跑一次(给首次心跳留点时间);失败后每 30 秒重试,成功后退到 5 分钟一次轮询
+// (兜底应对 NAT 出口 IP 漂移)。
+//
+// 跟旧版直接在 heartbeat 里同步 detect 的对比:
+//   - 旧版:detect 阻塞心跳最多 12s,失败仍每 5 分钟阻塞一次
+//   - 新版:心跳零阻塞,detect 异步;v4 失败时 30s 后台重试,远快于 5 分钟心跳
+//
+// 这是修复"重启后 v4 偶发探测失败 → 进程级永久空缓存"的核心机制。
+func (c *Client) startIPProbeLoop(ctx context.Context) {
+	go c.ipProbeLoop(ctx)
+}
+
+func (c *Client) ipProbeLoop(ctx context.Context) {
+	probeOnce := func() {
+		c.ipMu.RLock()
+		curV4, curV6 := c.publicIPv4, c.publicIPv6
+		c.ipMu.RUnlock()
+
+		newV4 := curV4
+		newV6 := curV6
+		if newV4 == "" {
+			if v := c.detectPublicIPv4(); v != "" {
+				newV4 = v
+				log.Printf("[Agent] Public IPv4 detected: %s", v)
+			}
+		}
+		if newV6 == "" {
+			if v := c.detectPublicIPv6(); v != "" {
+				newV6 = v
+				log.Printf("[Agent] Public IPv6 detected: %s", v)
+			}
+		}
+		if newV4 != curV4 || newV6 != curV6 {
+			c.ipMu.Lock()
+			c.publicIPv4 = newV4
+			c.publicIPv6 = newV6
+			c.ipMu.Unlock()
+		}
+	}
+
+	// 启动后立即 detect 一次,让首次心跳有更高概率带上 v4
+	probeOnce()
+
+	// 重试节奏:v4 还没拿到 → 30s 重试;已拿到 → 5min 轮询(出口 IP 漂移兜底)
+	for {
+		c.ipMu.RLock()
+		needV4 := c.publicIPv4 == ""
+		c.ipMu.RUnlock()
+
+		delay := 5 * time.Minute
+		if needV4 {
+			delay = 30 * time.Second
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		probeOnce()
+	}
 }
 
 // 创建 agent 客户端。
@@ -167,6 +250,10 @@ func (c *Client) newRequest(ctx context.Context, method, urlStr string, body []b
 // 按配置启动客户端。
 func (c *Client) Start(ctx context.Context) {
 	log.Printf("[Agent] Starting in %s mode", c.config.ConnectionMode)
+
+	// 后台 IP detect 循环 — 启动时立即跑一次,失败时 30s 重试,直到拿到 v4 / v6。
+	// 不阻塞 WS / HTTP / pull 模式的握手路径。
+	c.startIPProbeLoop(ctx)
 
 	mode := ConnectionMode(c.config.ConnectionMode)
 
@@ -399,23 +486,25 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 	// auth 时把缓存的 public_ipv4 也带上,让 master 在第一次 heartbeat 到来之前(~10s 窗口)
 	// 就有正确的 v4 IP 可用,避开 master 重启 → preferV4DialContext 偶尔 v6 → auth 时 master
 	// 用 WS 源 IP (v6) 写 db → master 反向请求 agent 走 v6 → 失败 的时序问题。
-	// publicIPv4 在首次 sendHeartbeat 时才 detect,所以这里同样懒加载一次,避免空字段。
-	if c.publicIPv4 == "" {
-		c.publicIPv4 = c.detectPublicIPv4()
-	}
-	// publicIPv6 独立探测(detectPublicIPv6 仅返回 v6 字符串)— dual-stack 服务器才有非空值
-	if c.publicIPv6 == "" {
-		c.publicIPv6 = c.detectPublicIPv6()
-	}
+	// 直接读后台 ipProbeLoop 维护的缓存,不在心跳路径上同步 detect(否则阻塞 12s)。
+	// 启动时 startIPProbeLoop 立即跑一次 detect,等首次心跳触发时通常已有值;
+	// 偶发首次仍空也没关系,master 端 COALESCE 保留 db 旧 v4。
+	publicIPv4 := c.getPublicIPv4()
+	publicIPv6 := c.getPublicIPv6()
 	// capabilities.rpc = true 告诉 master 本 agent 能接 WSMsgTypeRPCCall,master 可以把
 	// 原本走 HTTP /api/child/* 的反向调用切到 WS,绕开 IPv6 漂移 / NAT 反向不通的痛点。
 	// capabilities.stream = true 告诉 master 本 agent 还能跑 rpc_call(Stream:true) → rpc_stream_data
 	// 流式协议,可替代 /api/child/xxx-stream SSE。两者实际依赖同一份 rpcMux,所以一起 toggle。
 	rpcAvailable := c.rpcMux != nil
+	warpInstalled := false
+	if c.warpStatusFn != nil {
+		warpInstalled = c.warpStatusFn()
+	}
 	authPayload, _ := json.Marshal(map[string]any{
-		"token":       c.config.Token,
-		"public_ipv4": c.publicIPv4,
-		"public_ipv6": c.publicIPv6,
+		"token":          c.config.Token,
+		"public_ipv4":    publicIPv4,
+		"public_ipv6":    publicIPv6,
+		"warp_installed": warpInstalled,
 		"capabilities": map[string]bool{
 			"rpc":    rpcAvailable,
 			"stream": rpcAvailable,
@@ -675,19 +764,21 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 
 // 发送心跳消息。
 func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
-	if c.publicIPv4 == "" {
-		c.publicIPv4 = c.detectPublicIPv4()
-	}
-	if c.publicIPv6 == "" {
-		c.publicIPv6 = c.detectPublicIPv6()
-	}
+	// 同 authenticate:从 ipProbeLoop 维护的缓存读,不阻塞心跳。
+	publicIPv4 := c.getPublicIPv4()
+	publicIPv6 := c.getPublicIPv6()
 	listenPort, _ := strconv.Atoi(c.config.ListenPort)
+	warpInstalled := false
+	if c.warpStatusFn != nil {
+		warpInstalled = c.warpStatusFn()
+	}
 	payload, _ := json.Marshal(map[string]any{
-		"boot_time":   c.startTime,
-		"listen_port": listenPort,
-		"local_time":  time.Now().Unix(),
-		"public_ipv4": c.publicIPv4,
-		"public_ipv6": c.publicIPv6,
+		"boot_time":      c.startTime,
+		"listen_port":    listenPort,
+		"local_time":     time.Now().Unix(),
+		"public_ipv4":    publicIPv4,
+		"public_ipv6":    publicIPv6,
+		"warp_installed": warpInstalled,
 	})
 
 	msg := map[string]interface{}{
@@ -717,68 +808,51 @@ func preferV4DialContext(ctx context.Context, _, addr string) (net.Conn, error) 
 	return v6.DialContext(ctx, "tcp6", addr)
 }
 
-// detectPublicIPv4 探测本机出口公网 IP。优先 IPv4,回退 IPv6 — 兼顾 IPv6-only 服务器。
-// 函数名保留 "v4" 是为了不破坏 wire payload 兼容性(master 心跳字段名是 public_ipv4),
-// 但实际返回可能是 v6 字符串,master 已能处理任意 IP literal。
+// detectPublicIPv4 严格探测本机公网 IPv4。**只**返回 v4 字符串,失败返回空串。
 //
-// 探测策略:
-//  1. 用强制 tcp4 dialer 请求多个 IPv4 endpoint — 成功即返回 v4
-//  2. 全部失败(IPv4 不通 / 服务器是 IPv6-only)→ 用 tcp6 dialer 请求 v6 endpoint
-//  3. 还失败 → 返回空字符串
+// 历史:曾经在 v4 探测失败时 fallback 到 v6,设计意图是兼顾 IPv6-only 服务器。但实际后果是:
+// dual-stack 服务器若遇到 v4 endpoint 偶发不通(4.ipw.cn 慢 / DNS 抖动 / probe 服务 5xx),
+// fallback 会把 v6 字符串装进 publicIPv4 缓存,master 用它覆盖 db.ip_address →
+// IPv4-only master 反向 HTTP 全部 502。
+//
+// 新策略:v4 字段严格只装 v4。IPv6-only 服务器走 detectPublicIPv6() + master 端 IPAddressV6 候选。
+// master `buildAgentURLCandidates` 已经能在 IPAddress=空 时只走 IPAddressV6,行为兼容。
 func (c *Client) detectPublicIPv4() string {
-	// v4 探测 3s,v6 探测 5s — 与 preferV4DialContext 同款时序
-	makeClient := func(network string, timeout time.Duration) *http.Client {
-		dialer := &net.Dialer{Timeout: timeout}
-		return &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-					return dialer.DialContext(ctx, network, addr)
-				},
-				TLSHandshakeTimeout: timeout,
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "tcp4", addr)
 			},
-		}
+			TLSHandshakeTimeout: 3 * time.Second,
+		},
 	}
-	probe := func(client *http.Client, urls []string, want4 bool) string {
-		for _, u := range urls {
-			resp, err := client.Get(u)
-			if err != nil {
-				continue
-			}
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				continue
-			}
-			ip := strings.TrimSpace(string(body))
-			parsed := net.ParseIP(ip)
-			if parsed == nil {
-				continue
-			}
-			isV4 := parsed.To4() != nil
-			if want4 && !isV4 {
-				continue
-			}
-			return ip
-		}
-		return ""
-	}
-	// 1) 强制 IPv4(3s)
-	if ip := probe(makeClient("tcp4", 3*time.Second), []string{
+	urls := []string{
 		"https://4.ipw.cn",
 		"https://api4.ipify.org",
 		"https://ipv4.icanhazip.com",
 		"https://v4.ident.me",
-	}, true); ip != "" {
+	}
+	for _, u := range urls {
+		resp, err := client.Get(u)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		parsed := net.ParseIP(ip)
+		// 严格校验:必须是 v4。parsed.To4() != nil 同时排除 nil 和 v6 字符串。
+		if parsed == nil || parsed.To4() == nil {
+			continue
+		}
 		return ip
 	}
-	// 2) IPv4 拿不到 → 试 IPv6(5s)
-	return probe(makeClient("tcp6", 5*time.Second), []string{
-		"https://6.ipw.cn",
-		"https://api6.ipify.org",
-		"https://ipv6.icanhazip.com",
-		"https://v6.ident.me",
-	}, false)
+	return ""
 }
 
 // detectPublicIPv6 仅探测公网 IPv6。dual-stack 服务器才会拿到非空,IPv4-only 返回空。
