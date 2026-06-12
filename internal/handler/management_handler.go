@@ -2948,7 +2948,21 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 			routing = map[string]interface{}{}
 		}
 		rules, _ := routing["rules"].([]interface{})
-		rules = append(rules, req.Rule)
+		// 按 marktag 智能插入:1 user routed → 2 admin routed → 3 家宽/测速 warp → 4 其他。
+		// 同优先级内新规则居前;不重排现有规则(只决定新 rule 落点)。
+		newP := classifyRulePriority(req.Rule)
+		insertAt := len(rules)
+		for i, r := range rules {
+			rm, ok := r.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if classifyRulePriority(rm) >= newP {
+				insertAt = i
+				break
+			}
+		}
+		rules = append(rules[:insertAt], append([]interface{}{req.Rule}, rules[insertAt:]...)...)
 		routing["rules"] = rules
 		config["routing"] = routing
 
@@ -5294,4 +5308,37 @@ func (h *ManageHandler) ensureExternalXray() error {
 	}
 	log.Printf("[Manage] External xray service enabled and started")
 	return nil
+}
+
+// classifyRulePriority 把单条 routing rule 按 marktag 归类成 4 个优先级,数字越小越靠前:
+//
+//	1 - user 私有 routed 出站(marktag = "routed:<shortID>:u<username>:<labelSlug>",4 段)
+//	2 - admin 共享 routed 出站(marktag = "routed:<shortID>:<labelSlug>",3 段)
+//	3 - 家宽常用 / 测速分流 两个快捷预设(marktag 白名单匹配)
+//	4 - 其他规则(空 marktag、自定义、ban_bt / fix_openai / warp_anti_china 等)
+//
+// 段数判断稳:simpleSlug 把非 [a-z0-9-] 全换成 -,labelSlug 不含冒号,所以
+// "routed:" 前缀 + ":" 段数 = 3 或 4 可唯一区分 admin vs user。
+// 不依赖 ":u" 前缀 — 避免 admin 起 label 叫 "unlock" 时被误判成 user。
+func classifyRulePriority(rule map[string]interface{}) int {
+	if rule == nil {
+		return 4
+	}
+	marktag, _ := rule["marktag"].(string)
+	if strings.HasPrefix(marktag, "routed:") {
+		parts := strings.Split(marktag, ":")
+		switch len(parts) {
+		case 4:
+			return 1 // routed:<id>:u<user>:<label>
+		case 3:
+			return 2 // routed:<id>:<label>
+		}
+		// 段数不匹配:可能是老格式 / 异常 marktag,降级到 admin 等级,不当 user 优待
+		return 2
+	}
+	switch marktag {
+	case "home_broadband_warp", "speedtest_warp":
+		return 3
+	}
+	return 4
 }
