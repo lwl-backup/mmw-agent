@@ -4,18 +4,43 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"golang.org/x/time/rate"
 )
+
+// ipEntry 单个 IP 的元数据,带 lastSeen 用于 LRU 踢最旧。
+type ipEntry struct {
+	uid      int
+	lastSeen time.Time
+}
+
+// emailIPMap 是 per-user 的 IP 表 + mutex。
+// 设计:
+//   - 用 map[ip]*ipEntry 替代之前的 sync.Map,需要遍历找 lastSeen 最旧的项,sync.Map 不擅长
+//   - 内部加一把 mutex 串行化 read-modify-write(检查超限 → 踢最旧 → 加新),避免并发覆盖
+type emailIPMap struct {
+	mu sync.Mutex
+	m  map[string]*ipEntry
+}
+
+func newEmailIPMap() *emailIPMap {
+	return &emailIPMap{m: make(map[string]*ipEntry)}
+}
 
 type InboundInfo struct {
 	Tag            string
 	NodeSpeedLimit uint64    // Bytes/s, 0 = unlimited
 	UserInfo       *sync.Map // key: "tag|email" -> UserInfo
 	BucketHub      *sync.Map // key: "tag|email" -> *rate.Limiter
-	UserOnlineIP   *sync.Map // key: "tag|email" -> *sync.Map{ip -> uid}
+	UserOnlineIP   *sync.Map // key: email -> *emailIPMap (内层 ip -> *ipEntry + mu)
 }
+
+// KickCounter 累计每个 email 被「踢最旧」的次数(Phase 3B 上报给主控用,主控收到 delta → tg 通知)
+// 采用 sync.Map[email]*int64,累计语义(从 agent 启动开始单调递增);主控算 delta = current - prev_seen
+var KickCounter sync.Map // map[string]*int64
 
 type Limiter struct {
 	InboundInfo *sync.Map // key: tag -> *InboundInfo
@@ -95,32 +120,51 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		return true
 	})
 
-	// Device limit check
+	// Device limit check — 策略改为「踢最旧」(LRU evict):
+	//   - 已有该 ip → 仅更新 lastSeen,放行
+	//   - 新 ip 且 count < limit → 加进去,放行
+	//   - 新 ip 且 count >= limit → 找 lastSeen 最早的删,加新的进去,KickCounter[email]++,放行
+	//
+	// 注:依赖客户端连接 keepalive 超时让旧连接自然断;agent 无主动断 xray 连接的 API。
+	// 被踢的 IP 下次包到达时走"新 IP 加入"路径,如果还在超限会再次被踢出。
+	now := time.Now()
 	if deviceLimit > 0 {
-		ipMap := new(sync.Map)
-		ipMap.Store(ip, uid)
-		if v, loaded := info.UserOnlineIP.LoadOrStore(email, ipMap); loaded {
-			existingMap := v.(*sync.Map)
-			if _, exists := existingMap.LoadOrStore(ip, uid); !exists {
-				count := 0
-				existingMap.Range(func(_, _ interface{}) bool {
-					count++
-					return true
-				})
-				if count > deviceLimit {
-					existingMap.Delete(ip)
-					return nil, false, true
+		ipMap := newEmailIPMap()
+		actual, _ := info.UserOnlineIP.LoadOrStore(email, ipMap)
+		em := actual.(*emailIPMap)
+		em.mu.Lock()
+		if entry, exists := em.m[ip]; exists {
+			entry.lastSeen = now
+		} else if len(em.m) < deviceLimit {
+			em.m[ip] = &ipEntry{uid: uid, lastSeen: now}
+		} else {
+			// evict 最旧:扫一遍找 minLastSeen
+			var oldestIP string
+			var oldestTime time.Time
+			first := true
+			for k, v := range em.m {
+				if first || v.lastSeen.Before(oldestTime) {
+					oldestIP = k
+					oldestTime = v.lastSeen
+					first = false
 				}
 			}
+			if oldestIP != "" {
+				delete(em.m, oldestIP)
+			}
+			em.m[ip] = &ipEntry{uid: uid, lastSeen: now}
+			// 累计 kick 次数(Phase 3B 上报用)
+			incrementKickCounter(email)
 		}
+		em.mu.Unlock()
 	} else {
-		// Still track IP for online user reporting
-		ipMap := new(sync.Map)
-		ipMap.Store(ip, uid)
-		if v, loaded := info.UserOnlineIP.LoadOrStore(email, ipMap); loaded {
-			existingMap := v.(*sync.Map)
-			existingMap.Store(ip, uid)
-		}
+		// 无 device limit,仍要记 IP 给 online users 上报
+		ipMap := newEmailIPMap()
+		actual, _ := info.UserOnlineIP.LoadOrStore(email, ipMap)
+		em := actual.(*emailIPMap)
+		em.mu.Lock()
+		em.m[ip] = &ipEntry{uid: uid, lastSeen: now}
+		em.mu.Unlock()
 	}
 
 	// Speed limit
@@ -167,12 +211,13 @@ func (l *Limiter) GetOnlineUsers(tag string) map[string][]string {
 
 	info.UserOnlineIP.Range(func(key, value interface{}) bool {
 		email := key.(string)
-		ipMap := value.(*sync.Map)
+		em := value.(*emailIPMap)
 		var ips []string
-		ipMap.Range(func(k, _ interface{}) bool {
-			ips = append(ips, k.(string))
-			return true
-		})
+		em.mu.Lock()
+		for ip := range em.m {
+			ips = append(ips, ip)
+		}
+		em.mu.Unlock()
 		if len(ips) > 0 {
 			result[email] = ips
 		}
@@ -181,6 +226,26 @@ func (l *Limiter) GetOnlineUsers(tag string) map[string][]string {
 	})
 
 	return result
+}
+
+// incrementKickCounter 每被"踢最旧"一次,该 email 累计 +1。Phase 3B 主控收集 delta。
+func incrementKickCounter(email string) {
+	var counter int64 = 1
+	if v, loaded := KickCounter.LoadOrStore(email, &counter); loaded {
+		atomic.AddInt64(v.(*int64), 1)
+	}
+}
+
+// SnapshotKickCounter 返回当前所有 email 的累计被踢次数(给上报用),不清零。
+// 主控按 delta = current - last_seen_per_email 算单周期增量。
+func SnapshotKickCounter() map[string]int64 {
+	out := make(map[string]int64)
+	KickCounter.Range(func(k, v interface{}) bool {
+		email := k.(string)
+		out[email] = atomic.LoadInt64(v.(*int64))
+		return true
+	})
+	return out
 }
 
 // SetUserSpeed temporarily overrides a user's speed limit bucket.

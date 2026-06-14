@@ -2235,10 +2235,16 @@ func (c *Client) sendScanResult(conn *websocket.Conn) {
 		}
 	}
 
+	// Phase 3B: 上报 limiter KickCounter(累计每个 email 被「踢最旧」的总次数,自 agent 启动起单调递增)
+	// 主控按 delta 算单周期增量,delta>0 触发 tg 通知。
+	// 老主控收到此字段直接忽略,无影响。
+	deviceKicks := limiter.SnapshotKickCounter()
+
 	payload, _ := json.Marshal(map[string]interface{}{
-		"xray_running": xrayRunning,
-		"xray_version": xrayVersion,
-		"inbounds":     inbounds,
+		"xray_running":  xrayRunning,
+		"xray_version":  xrayVersion,
+		"inbounds":      inbounds,
+		"device_kicks":  deviceKicks,
 	})
 
 	msg := map[string]interface{}{
