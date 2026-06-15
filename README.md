@@ -49,6 +49,10 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.3.1 (2026-06-15)
+- 🌈增加docker镜像(beta)
+- 🌈增加系统流量上报
+
 ### v0.3.0 (2026-06-14)
 - 🛠️ fix:warp出站冗余配置
 - 🛠️ fix:只有ipv6的机器无法下周geodata
