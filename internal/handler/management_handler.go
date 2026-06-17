@@ -1762,6 +1762,10 @@ type InboundRequest struct {
 	// add 场景按协议放进 settings.clients(VLESS/VMess/Trojan/Hysteria/Shadowsocks)
 	// 或 settings.accounts(SOCKS/HTTP);remove 场景按 matchCredentialMap 同字段匹配。
 	Client map[string]interface{} `json:"client,omitempty"`
+	// 仅 action=add-sniffing-exclude 使用:幂等追加到 inbound.sniffing.excludeDomains 的域名列表。
+	// 典型用途:创建 vless+reality routed outbound 时,把 outbound 的伪装 SNI 加入父 inbound 的
+	// sniffing 排除清单,避免 inbound 把伪装 SNI 嗅探成「真实目标」误导路由。
+	Domains []string `json:"domains,omitempty"`
 }
 
 // 处理入站管理请求。
@@ -2217,6 +2221,9 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 	case "add-client", "remove-client":
 		h.manageInboundClient(w, ctx, action, &req)
 		return
+	case "add-sniffing-exclude":
+		h.manageInboundSniffingExclude(w, ctx, &req)
+		return
 	}
 
 	if h.xrayMode == "embedded" && h.embeddedXray != nil {
@@ -2547,6 +2554,133 @@ func (h *ManageHandler) manageInboundClient(w http.ResponseWriter, ctx context.C
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": fmt.Sprintf("client %sd", action),
+	})
+}
+
+// manageInboundSniffingExclude 幂等追加域名到 inbound.sniffing.excludeDomains。
+// 典型用途:routed outbound 是 vless+reality 时,把出站伪装 SNI 加到父 inbound 的 sniffing 排除清单,
+// 避免 inbound 把伪装 SNI 嗅探成「真实目标」误导路由(用户实际访问的域名被 reality SNI 劫持)。
+//
+// 行为:
+//   - inbound 无 sniffing 字段 → 初始化 {enabled:true, destOverride:["http","tls"], excludeDomains:[]}
+//   - inbound 已有 sniffing 但无 excludeDomains 字段 → 创建空数组再追加
+//   - 域名已在数组中 → 跳过(幂等);全部域名都已在 → 整轮 no-op,不写盘
+//   - 调用方必须持有 inboundsMu(manageInbound 入口已加锁)
+func (h *ManageHandler) manageInboundSniffingExclude(w http.ResponseWriter, ctx context.Context, req *InboundRequest) {
+	if req.Tag == "" {
+		writeError(w, http.StatusBadRequest, "tag is required")
+		return
+	}
+	if len(req.Domains) == 0 {
+		writeError(w, http.StatusBadRequest, "domains is required")
+		return
+	}
+
+	configPath := h.findXrayConfigPath()
+	if configPath == "" {
+		writeError(w, http.StatusNotFound, "Xray config not found")
+		return
+	}
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("read config: %v", err))
+		return
+	}
+	var config map[string]interface{}
+	if err := json.Unmarshal(content, &config); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("parse config: %v", err))
+		return
+	}
+
+	inbounds, _ := config["inbounds"].([]interface{})
+	var target map[string]interface{}
+	for _, ib := range inbounds {
+		m, ok := ib.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := m["tag"].(string); t == req.Tag {
+			target = m
+			break
+		}
+	}
+	if target == nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("inbound %s not found", req.Tag))
+		return
+	}
+
+	sniffing, _ := target["sniffing"].(map[string]interface{})
+	if sniffing == nil {
+		sniffing = map[string]interface{}{
+			"enabled":      true,
+			"destOverride": []interface{}{"http", "tls"},
+		}
+	}
+	rawExcludes, _ := sniffing["excludeDomains"].([]interface{})
+	existing := make(map[string]bool, len(rawExcludes))
+	for _, v := range rawExcludes {
+		if s, ok := v.(string); ok {
+			existing[s] = true
+		}
+	}
+	added := 0
+	for _, d := range req.Domains {
+		d = strings.TrimSpace(d)
+		if d == "" || existing[d] {
+			continue
+		}
+		rawExcludes = append(rawExcludes, d)
+		existing[d] = true
+		added++
+	}
+	if added == 0 {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "all domains already present (no-op)",
+		})
+		return
+	}
+	sniffing["excludeDomains"] = rawExcludes
+	target["sniffing"] = sniffing
+
+	// 写盘前剥掉 enumeration metadata,跟 manageInboundClient 同款清理
+	for k := range target {
+		if strings.HasPrefix(k, "_") {
+			delete(target, k)
+		}
+	}
+	dedupeTaggedArrayInPlace(config, "inbounds")
+	dedupeTaggedArrayInPlace(config, "outbounds")
+
+	newContent, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("marshal config: %v", err))
+		return
+	}
+	tmp := configPath + ".tmp"
+	if err := os.WriteFile(tmp, newContent, 0644); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("write tmp config: %v", err))
+		return
+	}
+	if err := os.Rename(tmp, configPath); err != nil {
+		os.Remove(tmp)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("rename config: %v", err))
+		return
+	}
+
+	// 运行时应用:sniffing 改动跟 client 增删一样,需重装 inbound 才能生效
+	if err := h.replaceRuntimeInbound(ctx, req.Tag, target); err != nil {
+		log.Printf("[Manage] manageInboundSniffingExclude: runtime apply failed (tag=%s): %v; config file already updated", req.Tag, err)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success":         true,
+			"message":         fmt.Sprintf("added %d domain(s) to sniffing.excludeDomains, runtime apply deferred", added),
+			"runtime_warning": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("added %d domain(s) to sniffing.excludeDomains", added),
 	})
 }
 
