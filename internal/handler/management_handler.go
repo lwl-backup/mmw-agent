@@ -2631,6 +2631,10 @@ type OutboundRequest struct {
 	Action   string                 `json:"action"`
 	Outbound map[string]interface{} `json:"outbound,omitempty"`
 	Tag      string                 `json:"tag,omitempty"`
+	// reorder action 专用:按此顺序在 xray config 文件层重排 outbounds 数组。
+	// 数组首条 = xray 「无规则命中时的默认出站」,排序直接影响这条语义。
+	// 运行时 xray 按 tag 命中 routing rule,数组顺序对路由本身无影响,故 reorder 不需要 xray Handler API 改动。
+	Tags []string `json:"tags,omitempty"`
 }
 
 // 处理出站管理请求。
@@ -2830,8 +2834,73 @@ func (h *ManageHandler) manageOutbound(w http.ResponseWriter, r *http.Request) {
 			"message": "Outbound updated successfully",
 		})
 
+	case "reorder":
+		// 按 req.Tags 顺序重排 outbounds 数组 — 只动 config 文件,不调 xray Handler API
+		// (xray 运行时不依赖数组顺序;但加载配置时数组首条作为默认出站,所以重启 xray 才能让新默认生效)。
+		// 不在 tags 中的 outbound 保持原相对顺序追加在末尾;tags 中找不到对应 outbound 的项跳过。
+		if len(req.Tags) == 0 {
+			writeError(w, http.StatusBadRequest, "tags is required for reorder action")
+			return
+		}
+		configPath := h.findXrayConfigPath()
+		if configPath == "" {
+			writeError(w, http.StatusNotFound, "Xray config not found")
+			return
+		}
+		promoteOutboundTagsInFile(configPath)
+		content, err := os.ReadFile(configPath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("read config: %v", err))
+			return
+		}
+		var config map[string]interface{}
+		if err := json.Unmarshal(content, &config); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("parse config: %v", err))
+			return
+		}
+		obArr, _ := config["outbounds"].([]interface{})
+		// tag → outbound 索引(原数组里的)
+		idxByTag := make(map[string]int, len(obArr))
+		for i, ob := range obArr {
+			m, ok := ob.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if tag, _ := m["tag"].(string); tag != "" {
+				idxByTag[tag] = i
+			}
+		}
+		used := make(map[int]bool, len(obArr))
+		reordered := make([]interface{}, 0, len(obArr))
+		for _, tag := range req.Tags {
+			if i, ok := idxByTag[tag]; ok && !used[i] {
+				reordered = append(reordered, obArr[i])
+				used[i] = true
+			}
+		}
+		// 保留未在 tags 中的 outbound,按原相对顺序追加
+		for i, ob := range obArr {
+			if !used[i] {
+				reordered = append(reordered, ob)
+			}
+		}
+		config["outbounds"] = reordered
+		newContent, err := json.MarshalIndent(config, "", "  ")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("marshal config: %v", err))
+			return
+		}
+		if err := os.WriteFile(configPath, newContent, 0644); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write config: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Outbounds reordered",
+		})
+
 	default:
-		writeError(w, http.StatusBadRequest, "Invalid action. Must be 'add', 'remove' or 'update'")
+		writeError(w, http.StatusBadRequest, "Invalid action. Must be 'add', 'remove', 'update' or 'reorder'")
 	}
 }
 
@@ -4426,6 +4495,70 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// HandleNginxServersList 列出本机 nginx servers/ 目录下所有 *.conf 域名文件,
+// 用于前端在添加 vless+wss 入站前检测目标域名是否已被 reality / 旧 wss 占用。
+// 扫描目录:detectNginxConfDirFromBinary 拿到的权威 confDir 的 servers/ 子目录 +
+// NginxSSLServerDirPaths 列表(冗余兜底 — 历史装机可能落在不同前缀)。dedup by domain。
+func (h *ManageHandler) HandleNginxServersList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// 扫描目录集合 = 权威 confDir/servers + 已知 fallback 路径,dedup
+	dirs := make([]string, 0, len(constants.NginxSSLServerDirPaths)+1)
+	if confDir := detectNginxConfDirFromBinary(); confDir != "" {
+		dirs = append(dirs, filepath.Join(confDir, "servers"))
+	}
+	dirs = append(dirs, constants.NginxSSLServerDirPaths...)
+
+	type domainEntry struct {
+		Domain  string `json:"domain"`
+		Path    string `json:"path"`
+		ModTime string `json:"mod_time"`
+		Size    int64  `json:"size"`
+	}
+	seen := make(map[string]bool)
+	domains := []domainEntry{}
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".conf") {
+				continue
+			}
+			domain := strings.ToLower(strings.TrimSuffix(e.Name(), ".conf"))
+			if seen[domain] {
+				continue
+			}
+			seen[domain] = true
+			fullPath := filepath.Join(dir, e.Name())
+			info, ierr := e.Info()
+			if ierr != nil {
+				domains = append(domains, domainEntry{Domain: domain, Path: fullPath})
+				continue
+			}
+			domains = append(domains, domainEntry{
+				Domain:  domain,
+				Path:    fullPath,
+				ModTime: info.ModTime().UTC().Format(time.RFC3339),
+				Size:    info.Size(),
+			})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"domains": domains,
+	})
+}
+
 func (h *ManageHandler) HandleValidateSite(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -5357,8 +5490,9 @@ func (h *ManageHandler) ensureExternalXray() error {
 	return nil
 }
 
-// classifyRulePriority 把单条 routing rule 按 marktag 归类成 4 个优先级,数字越小越靠前:
+// classifyRulePriority 把单条 routing rule 按 marktag/outboundTag 归类成 5 个优先级,数字越小越靠前:
 //
+//	0 - 端口转发(outboundTag 以 "tunnel-" 开头),xray 按序匹配,必须置顶以免被下游 routed/warp/api 截胡
 //	1 - user 私有 routed 出站(marktag = "routed:<shortID>:u<username>:<labelSlug>",4 段)
 //	2 - admin 共享 routed 出站(marktag = "routed:<shortID>:<labelSlug>",3 段)
 //	3 - 家宽常用 / 测速分流 两个快捷预设(marktag 白名单匹配)
@@ -5367,9 +5501,15 @@ func (h *ManageHandler) ensureExternalXray() error {
 // 段数判断稳:simpleSlug 把非 [a-z0-9-] 全换成 -,labelSlug 不含冒号,所以
 // "routed:" 前缀 + ":" 段数 = 3 或 4 可唯一区分 admin vs user。
 // 不依赖 ":u" 前缀 — 避免 admin 起 label 叫 "unlock" 时被误判成 user。
+// outboundTag = "tunnel-*" 是 miaomiaowuX 端口转发的命名约定(见前端 inbound-wizard generateTunnelTag),
+// 单独提到 priority 0 是因为 xray routing 按数组顺序短路匹配,这类规则若被 routed/warp 截胡,
+// 端口转发的语义就丢了。注意 "tunnel-in" 是 inboundTag(伪装入站),不会出现在 outboundTag,排除安全。
 func classifyRulePriority(rule map[string]interface{}) int {
 	if rule == nil {
 		return 4
+	}
+	if outboundTag, _ := rule["outboundTag"].(string); strings.HasPrefix(outboundTag, "tunnel-") {
+		return 0
 	}
 	marktag, _ := rule["marktag"].(string)
 	if strings.HasPrefix(marktag, "routed:") {

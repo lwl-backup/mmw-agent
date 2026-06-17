@@ -34,6 +34,7 @@ func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandl
 	mux.HandleFunc(constants.PathChildScan, manageHandler.HandleScan)
 	mux.HandleFunc(constants.PathChildCertDeploy, manageHandler.HandleCertDeploy)
 	mux.HandleFunc(constants.PathChildNginxSetup, manageHandler.HandleNginxSetupSSL)
+	mux.HandleFunc(constants.PathChildNginxServersList, manageHandler.HandleNginxServersList)
 	mux.HandleFunc(constants.PathChildDomainProbe, manageHandler.HandleDomainLatencyProbe)
 	mux.HandleFunc(constants.PathChildNginxClearStream, manageHandler.HandleClearStreamPort)
 	mux.HandleFunc(constants.PathChildValidateSite, manageHandler.HandleValidateSite)

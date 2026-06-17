@@ -26,6 +26,9 @@ const (
 	PathChildScan         = "/api/child/scan"
 	PathChildCertDeploy   = "/api/child/cert/deploy"
 	PathChildNginxSetup   = "/api/child/nginx/setup-ssl"
+	// PathChildNginxServersList 列出 setup-ssl 实际写入的 servers/ 目录里所有 *.conf,
+	// 用于前端在 wss 提交前检测目标域名是否已被(reality / 旧 wss)占用。
+	PathChildNginxServersList = "/api/child/nginx/servers-list"
 	PathChildDomainProbe       = "/api/child/domains/latency"
 	PathChildNginxClearStream  = "/api/child/nginx/clear-stream-port"
 	PathChildValidateSite      = "/api/child/validate-site"
